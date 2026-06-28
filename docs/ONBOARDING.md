@@ -1,0 +1,101 @@
+# Onboarding a source repo (the fast path)
+
+The scheduled `scan-backstop` already finds items in your fleet a few times a day with **no** changes to your other repos.
+This doc is the optional **fast path**: add a tiny dispatch workflow to a source repo so events show up in your queue in real time instead of waiting for the next scan.
+
+Nothing here is required to run the machine, and nothing here changes how the hub classifies items - a dispatch is just a low-latency nudge that creates (or updates) a card immediately; the backstop still reconciles everything later.
+
+> You add these files to **your source repos**, not to the triage hub.
+> The hub only ever reads; it never pushes to your source repos except to execute a decision you made.
+
+## The dispatch contract
+
+A source repo notifies the hub by sending a `repository_dispatch` event with **event type `triage-item`** to the hub repo, with a `client_payload` describing the item:
+
+| field            | required | meaning                                                            |
+| ---------------- | -------- | ------------------------------------------------------------------ |
+| `repo`           | yes      | the source repo **name** (no owner), e.g. `my-service`             |
+| `number`         | yes      | the PR or issue number                                             |
+| `kind`           | no       | `pr-review` (default), `ci-approval`, or `issue-triage`            |
+| `head_sha`       | no       | the PR head SHA - recommended; lets the hub refuse a stale merge   |
+| `title`          | no       | short title of the target                                          |
+| `author`         | no       | the PR/issue author's login                                        |
+| `summary`        | no       | one-line situation summary                                         |
+| `recommendation` | no       | recommended action shown on the card                              |
+| `priority`       | no       | `high` / `med` / `low`                                             |
+| `options`        | no       | comma-separated checkbox option keys (defaults follow `kind`)      |
+
+The hub's `ingest` workflow dedupes by target: a second dispatch for the same `repo`+`number` **updates** the existing card instead of creating a duplicate.
+
+## Token for the source side
+
+Sending a `repository_dispatch` to the hub requires a token with write access to the **hub** repo.
+
+- If your `FLEET_TOKEN` already includes the hub repo in its scope, you can reuse it.
+- Otherwise mint a fine-grained PAT scoped to **only the hub repo** with **Contents → Read and write**, and add it to the source repo as an Actions secret named `TRIAGE_DISPATCH_TOKEN`.
+
+## Copy-paste: source-repo workflow
+
+Add this as `.github/workflows/notify-triage-hub.yml` **in the source repo**.
+It fires when a non-draft PR is opened, marked ready, or labeled, and nudges the hub.
+Tune the trigger to match when *you* actually want to be asked (for example, only on a `ready-to-merge` label).
+
+```yaml
+name: notify-triage-hub
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, labeled, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch to the triage hub
+        env:
+          # A token that can write to the hub repo (reuse FLEET_TOKEN, or a
+          # hub-scoped PAT). Stored as a secret in THIS source repo.
+          GH_TOKEN: ${{ secrets.TRIAGE_DISPATCH_TOKEN }}
+          # The hub repo. "triage" is the default name - change it if you
+          # renamed your fork. Owner is derived, so this stays account-agnostic.
+          HUB: ${{ github.repository_owner }}/triage
+          # Pass GitHub context via env (never inline into the shell) so a PR
+          # title containing quotes/backticks can't break or inject the command.
+          P_REPO: ${{ github.event.repository.name }}
+          P_NUMBER: ${{ github.event.pull_request.number }}
+          P_SHA: ${{ github.event.pull_request.head.sha }}
+          P_TITLE: ${{ github.event.pull_request.title }}
+          P_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          payload="$(jq -nc \
+            --arg repo "$P_REPO" \
+            --arg number "$P_NUMBER" \
+            --arg sha "$P_SHA" \
+            --arg title "$P_TITLE" \
+            --arg author "$P_AUTHOR" \
+            '{event_type:"triage-item", client_payload:{
+                repo:$repo, number:($number|tonumber), kind:"pr-review",
+                head_sha:$sha, title:$title, author:$author }}')"
+          echo "$payload" | gh api "repos/$HUB/dispatches" --input -
+```
+
+### Notes
+
+- **Injection-safe by construction.** GitHub context values are passed through `env:` and read by `jq --arg`, never interpolated into the shell - a hostile PR title cannot break out.
+- **`ci-approval` items.** If you want fork-CI approvals to surface fast, add a job that dispatches with `kind:"ci-approval"` when a run reaches `action_required` (e.g. on `workflow_run`). The hub still applies the security HOLD before approving anything that touches CI files.
+- **Issues.** To push issue triage, dispatch with `kind:"issue-triage"` from an `issues` trigger. (The hub also cards issues from the backstop when `card_issues: true`.)
+- **Third-party alternative.** If you prefer, `peter-evans/repository-dispatch` does the same dispatch as an action; the `gh api` form above keeps you dependency-free.
+
+## Manual test (no source-repo changes)
+
+You can exercise the whole path without touching a source repo:
+
+1. In the hub, **Actions** ▸ **ingest** ▸ **Run workflow**.
+2. Fill in `repo`, `number`, and (recommended) `head_sha`.
+3. A decision card appears in the hub's issues. Tick a box to confirm the handler acts on the target.
+
+This is the quickest way to validate `FLEET_TOKEN` scope before wiring real dispatches.

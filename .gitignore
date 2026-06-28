@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local triage scratch (scan/cards/item artifacts produced at runtime)
+scan.json
+cards.json
+item.json
+create.json
+close.json
+target.txt
+prompt.txt

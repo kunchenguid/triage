@@ -1,0 +1,55 @@
+name: scan-backstop
+
+# The safety net behind the event path. On a schedule (and on demand), scan the
+# whole fleet, open cards for anything new that needs a decision, and close
+# cards whose target is already merged/closed - so the queue self-heals even if
+# a dispatch was lost. Cron is best-effort; the event path (ingest) is the fast
+# path.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *" # ~4x/day, best-effort
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: triage-backstop
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: github.event_name == 'schedule' || github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install deps
+        run: pip install --quiet pyyaml
+
+      # Cross-repo read of the whole fleet requires FLEET_TOKEN.
+      - name: Scan the fleet
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: python scripts/triage_core.py scan > scan.json
+
+      # Current open cards in THIS repo - default token.
+      - name: List open cards
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue list --state open --json number,body,labels,title --limit 300 > cards.json
+
+      # Reconcile (create new cards, close stale ones) in THIS repo - default
+      # token, so backstop activity never re-triggers the handler.
+      - name: Reconcile the queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: python scripts/reconcile.py scan.json cards.json

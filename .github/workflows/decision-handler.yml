@@ -1,0 +1,106 @@
+name: decision-handler
+
+# The heart: the maintainer ticks a checkbox or replies with a slash-command on
+# a decision card; we execute that decision on the TARGET repo and consume the
+# card. Owner-gated, serialized per issue.
+
+on:
+  issues:
+    types: [edited, labeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+# Serialize all handling of one card so concurrent ticks/comments can't race.
+concurrency:
+  group: triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  handle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install deps
+        run: pip install --quiet pyyaml
+
+      # Owner-gate: only the repository owner (or the configured `maintainer`)
+      # may drive a decision. Strangers' events become no-ops because every
+      # acting step below is gated on this output.
+      - id: gate
+        env:
+          SENDER: ${{ github.event.sender.login }}
+          OWNER: ${{ github.repository_owner }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: echo "authorized=$(python scripts/triage_core.py authorized)" >> "$GITHUB_OUTPUT"
+
+      # Parse the decision from the triggering event. No token, no side effects.
+      - id: decide
+        if: steps.gate.outputs.authorized == 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          OLD_BODY: ${{ github.event.changes.body.from }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          LABEL_NAME: ${{ github.event.label.name }}
+        run: python scripts/apply_decision.py parse
+
+      - name: Mark processing
+        if: steps.decide.outputs.decision != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create processing --force --color fbca04 >/dev/null 2>&1 || true
+          gh issue edit "${{ github.event.issue.number }}" --add-label processing || true
+
+      # Execute on the TARGET repo. This is the ONLY step that uses FLEET_TOKEN.
+      - id: execute
+        if: steps.decide.outputs.decision != ''
+        env:
+          # Cross-repo actions require FLEET_TOKEN. Never the default token,
+          # never printed.
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          DECISION: ${{ steps.decide.outputs.decision }}
+          FREE_TEXT: ${{ steps.decide.outputs.free_text }}
+          TARGET_REPO: ${{ steps.decide.outputs.target_repo }}
+          TARGET_NUMBER: ${{ steps.decide.outputs.target_number }}
+          KIND: ${{ steps.decide.outputs.kind }}
+          HEAD_SHA: ${{ steps.decide.outputs.head_sha }}
+        run: python scripts/apply_decision.py execute
+
+      # Bookkeeping on the card itself, with the default token (no re-trigger).
+      - name: Finalize card
+        if: ${{ always() && steps.decide.outputs.decision != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          MESSAGE: ${{ steps.execute.outputs.result_message }}
+          TERMINAL: ${{ steps.execute.outputs.terminal_state }}
+        run: |
+          for l in resolved blocked processing; do
+            gh label create "$l" --force --color ededed >/dev/null 2>&1 || true
+          done
+          gh issue comment "$ISSUE" --body "${MESSAGE:-No actionable result.}" || true
+          gh issue edit "$ISSUE" --remove-label processing >/dev/null 2>&1 || true
+          case "$TERMINAL" in
+            resolved)
+              gh issue edit "$ISSUE" --add-label resolved --remove-label needs-decision >/dev/null 2>&1 || true
+              gh issue close "$ISSUE" || true
+              ;;
+            blocked)
+              gh issue edit "$ISSUE" --add-label blocked --remove-label needs-decision >/dev/null 2>&1 || true
+              ;;
+            *)
+              : # 'none'/'error': leave the card open; the comment above carries the result
+              ;;
+          esac

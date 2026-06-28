@@ -1,0 +1,50 @@
+# triage.config.yml
+# =============================================================================
+# THE one file you edit to own this machine.
+#
+# Portability note: the OWNER is NOT set here. Every workflow derives the owner
+# from `github.repository_owner` at runtime, so this file works unchanged on any
+# account that forks or "Use this template"s the repo. List only repo *names*
+# (no "owner/" prefix) - they are resolved under your account/org.
+#
+# After editing this file and adding the FLEET_TOKEN secret, your triage machine
+# is live. See README.md for the full setup checklist.
+# =============================================================================
+
+# The fleet: the repositories you maintain and want triaged.
+# Replace these annotated placeholders with your own repos.
+repos:
+  - name: example-service          # repo name only (resolved under your owner)
+    # Exact name of a required status check that gates "is this PR allowed to
+    # merge" (e.g. a contribution-policy / DCO / required-CI check). Set to null
+    # if you have no such gate. When set, a PR is never shown as merge-ready
+    # until this check passes.
+    compliance_check: "required-policy-check"
+    # Substrings that identify your *test* / CI checks. A PR is "tests green"
+    # only when every check whose name contains one of these passes.
+    test_check_patterns: ["test", "build", "e2e"]
+
+  - name: example-cli
+    compliance_check: null
+    test_check_patterns: ["ci", "test"]
+
+  # Optional per-repo extras:
+  #   merge_method: squash    # squash | merge | rebase  (default: squash)
+  #                           # used when you approve a "Merge it" decision
+
+# Optional GitHub login allowed to drive decisions, in addition to the repo
+# owner. Leave empty to use the repository owner (github.repository_owner).
+maintainer: ""
+
+# Phase-2 LLM side-job. Leave false to run the fully deterministic machine with
+# only FLEET_TOKEN. Set true AND add the CLAUDE_CODE_OAUTH_TOKEN secret (from
+# `claude setup-token`, a Claude subscription token - NOT an API key) to enable
+# `deep-review` (label `needs-deep-review` -> Claude reviews the target and
+# comments back). Inert until both conditions are met.
+deep_review: false
+
+# Whether the scheduled backstop also opens decision cards for open *issues*
+# that have no linked PR (in addition to PRs that need your call). Phase-1
+# default is PRs only (high signal); flip to true once you want issue triage in
+# the queue, or rely on deep-review (phase 2) for issue triage.
+card_issues: false
