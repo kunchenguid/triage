@@ -14,23 +14,19 @@
 # The fleet: the repositories you maintain and want triaged.
 # Replace these annotated placeholders with your own repos.
 repos:
-  - name: example-service          # repo name only (resolved under your owner)
+  - name: lavish-axi               # repo name only (resolved under your owner)
     # Exact name of a required status check that gates "is this PR allowed to
-    # merge" (e.g. a contribution-policy / DCO / required-CI check). Set to null
-    # if you have no such gate. When set, a PR is never shown as merge-ready
-    # until this check passes.
-    compliance_check: "required-policy-check"
+    # merge". For lavish-axi this is the "raised via no-mistakes" contribution
+    # gate. Set to null if you have no such gate. When set, a PR is never shown
+    # as merge-ready until this check passes.
+    compliance_check: "PR must be raised via no-mistakes"
     # Substrings that identify your *test* / CI checks. A PR is "tests green"
-    # only when every check whose name contains one of these passes.
-    test_check_patterns: ["test", "build", "e2e"]
-
-  - name: example-cli
-    compliance_check: null
-    test_check_patterns: ["ci", "test"]
-
-  # Optional per-repo extras:
-  #   merge_method: squash    # squash | merge | rebase  (default: squash)
-  #                           # used when you approve a "Merge it" decision
+    # only when every check whose name contains one of these passes. lavish-axi
+    # runs a `build-and-test (<os>)` matrix across ubuntu/macos/windows.
+    test_check_patterns: ["build-and-test"]
+    # Optional per-repo extras:
+    merge_method: squash           # squash | merge | rebase (default: squash)
+    #                              # used when you approve a "Merge it" decision
 
 # Optional GitHub login allowed to drive decisions, in addition to the repo
 # owner. Leave empty to use the repository owner (github.repository_owner).
