@@ -5,7 +5,11 @@ Wheelhouse - backstop reconciler.
 The safety net behind the event-driven `ingest` path. Given a fresh scan of the
 fleet (scan.json) and the current open cards in THIS repo (cards.json), it:
 
-  * opens a decision card for any worklist item that has no open card, and
+  * opens a decision card for any worklist item that has no open card,
+  * refreshes an OPEN `needs-decision` card in place when its target's material
+    state changed (head_sha/compliance/tests/kind/priority) - so the queue
+    reflects current state, not just the snapshot taken when the card was first
+    created - and leaves materially-unchanged cards completely untouched, and
   * closes any open card whose underlying PR/issue is no longer open
     (merged/closed/resolved) - so the queue self-heals even if a dispatch was
     lost.
@@ -45,28 +49,48 @@ def main():
     items = scan.get("items", [])
 
     # Index existing open cards by their target (repo, number) from the state block.
-    existing = {}            # (repo, number) -> card number
+    existing = {}            # (repo, number) -> {number, state, labels}
     cards_with_state = []    # (card_number, state)
     for card in cards:
         state = core.parse_state_block(card.get("body", ""))
         if not state:
             continue  # a manually-created issue with no card state; leave it alone
         key = (state.get("repo"), int(state.get("number", 0)))
-        existing[key] = card["number"]
+        existing[key] = {"number": card["number"], "state": state,
+                         "labels": card.get("labels", [])}
         cards_with_state.append((card["number"], state))
 
-    # 1) Create cards for new items that have no open card.
+    # 1) For each scanned worklist item, create a card if none exists, else
+    #    refresh it in place when its target materially changed. Items only come
+    #    from ok:true repos (build_repo returns no items for a failed scan), so
+    #    this path never refreshes a card for a repo whose state is unknown.
     created = 0
+    refreshed = 0
     for item in items:
         key = (item["repo"], int(item["number"]))
-        if key in existing:
+        ex = existing.get(key)
+        if ex is None:
+            try:
+                render_card.upsert_card(item)
+                created += 1
+            except Exception as e:  # one bad item must not abort the whole pass
+                print("::warning::failed to create card for %s#%s: %s"
+                      % (item["repo"], item["number"], str(e)[:160]))
+            continue
+        # Card exists: refresh only a pure needs-decision card whose target
+        # materially changed. A card mid-decision (processing/resolved/blocked)
+        # or with no material change is left completely untouched (no edit, no
+        # comment). `upsert_card` re-checks both guards before it edits.
+        if not render_card.is_refreshable(ex["labels"]):
+            continue
+        if not render_card.material_changed(item, ex["state"]):
             continue
         try:
             render_card.upsert_card(item)
-            created += 1
-        except Exception as e:  # one bad item must not abort the whole pass
-            print("::warning::failed to create card for %s#%s: %s"
-                  % (item["repo"], item["number"], str(e)[:160]))
+            refreshed += 1
+        except Exception as e:
+            print("::warning::failed to refresh card #%s for %s#%s: %s"
+                  % (ex["number"], item["repo"], item["number"], str(e)[:160]))
 
     # 2) Close cards whose target is no longer open. Skip repos that failed to
     #    scan (ok:false) - we don't know their state, so we must not close.
@@ -90,7 +114,8 @@ def main():
         except Exception as e:
             print("::warning::failed to close card #%s: %s" % (card_number, str(e)[:160]))
 
-    print("reconcile: %d card(s) created, %d card(s) closed" % (created, closed))
+    print("reconcile: %d card(s) created, %d refreshed, %d card(s) closed"
+          % (created, refreshed, closed))
 
 
 if __name__ == "__main__":
