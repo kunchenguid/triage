@@ -1,8 +1,13 @@
 name: decision-handler
 
-# The heart: the maintainer ticks a checkbox or replies with a slash-command on
-# a decision card; we execute that decision on the TARGET repo and consume the
-# card. Owner-gated, serialized per issue.
+# The heart: the maintainer drives a decision card and we execute it on the
+# TARGET repo, then consume the card. Three ways to drive a card:
+#   * tick a checkbox            (issues.edited  - read via issue-ops/parser)
+#   * reply with a slash-command (issue_comment.created)
+#   * reply in plain English     (issue_comment.created - mapped by Claude, opt-in)
+# Owner-gated, serialized per issue. Whatever the entry point, any action on the
+# target runs through the one deterministic `execute` step (FLEET_TOKEN) so every
+# guard - per-kind allowlist, head-SHA re-check, fork-CI HOLD - always applies.
 
 on:
   issues:
@@ -34,7 +39,8 @@ jobs:
 
       # Owner-gate: only the repository owner (or the configured `maintainer`)
       # may drive a decision. Strangers' events become no-ops because every
-      # acting step below is gated on this output.
+      # acting step below is gated on this output (and the LLM never runs for
+      # them).
       - id: gate
         env:
           SENDER: ${{ github.event.sender.login }}
@@ -42,65 +48,225 @@ jobs:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: echo "authorized=$(python scripts/triage_core.py authorized)" >> "$GITHUB_OUTPUT"
 
-      # Parse the decision from the triggering event. No token, no side effects.
+      # --- Checkbox path -----------------------------------------------------
+      # Render the card's checkboxes as {selected, unselected} via
+      # issue-ops/parser, for both the new body and the pre-edit body. The
+      # deterministic diff (exactly one newly-ticked option) happens in
+      # apply_decision.py - we no longer scrape the Markdown by hand.
+      # Only on a real BODY change: a title-only edit leaves
+      # `changes.body.from` empty, and the parser errors on an empty `body`
+      # input. (Non-body edits can't have newly-ticked a box anyway.)
+      - id: checkboxes-new
+        if: ${{ steps.gate.outputs.authorized == 'true' && github.event_name == 'issues' && github.event.action == 'edited' && github.event.changes.body.from != '' }}
+        uses: issue-ops/parser@cb7e2e4e5da701aad0e23e718bc4c91d442ca8ba # v5.0.0
+        with:
+          body: ${{ github.event.issue.body }}
+          issue-form-template: triage-decision.yml
+      - id: checkboxes-old
+        if: ${{ steps.gate.outputs.authorized == 'true' && github.event_name == 'issues' && github.event.action == 'edited' && github.event.changes.body.from != '' }}
+        uses: issue-ops/parser@cb7e2e4e5da701aad0e23e718bc4c91d442ca8ba # v5.0.0
+        with:
+          body: ${{ github.event.changes.body.from }}
+          issue-form-template: triage-decision.yml
+
+      # Parse the deterministic decision (checkbox tick / slash / label). No
+      # token, no side effects.
       - id: decide
         if: steps.gate.outputs.authorized == 'true'
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action }}
           ISSUE_BODY: ${{ github.event.issue.body }}
-          OLD_BODY: ${{ github.event.changes.body.from }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           LABEL_NAME: ${{ github.event.label.name }}
+          CHECKBOXES_NEW: ${{ steps.checkboxes-new.outputs.json }}
+          CHECKBOXES_OLD: ${{ steps.checkboxes-old.outputs.json }}
         run: python scripts/apply_decision.py parse
 
-      - name: Mark processing
-        if: steps.decide.outputs.decision != ''
+      # --- Natural-language path (opt-in) ------------------------------------
+      # An owner comment that is NOT a slash-command. Gated on nl_decisions in
+      # config AND the CLAUDE_CODE_OAUTH_TOKEN secret; inert otherwise. Claude
+      # only MAPS intent to a structured result - the deterministic steps below
+      # do any acting, so every guard still applies.
+      - id: nl-gate
+        if: ${{ steps.gate.outputs.authorized == 'true' && github.event_name == 'issue_comment' && steps.decide.outputs.decision == '' }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          gh label create processing --force --color fbca04 >/dev/null 2>&1 || true
-          gh issue edit "${{ github.event.issue.number }}" --add-label processing || true
+          nl="$(python scripts/triage_core.py nl-decisions-enabled)"
+          eligible="$(python scripts/apply_decision.py nl-eligible)"
+          proceed=false
+          if [ "$nl" = "true" ] && [ "$HAS_TOKEN" = "true" ] && [ "$eligible" = "true" ]; then
+            proceed=true
+          fi
+          # `proceed` plus the target coordinates from the card's hidden state
+          # block (used by the fetch + execute steps below).
+          {
+            echo "proceed=$proceed"
+            echo "repo=$(python scripts/triage_core.py state repo)"
+            echo "number=$(python scripts/triage_core.py state number)"
+            echo "kind=$(python scripts/triage_core.py state kind)"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$proceed" != "true" ]; then
+            echo "nl path inert (nl_decisions=$nl, token_present=$HAS_TOKEN, eligible=$eligible)"
+          fi
+
+      # Read-only fetch of the target with FLEET_TOKEN so Claude can answer
+      # questions well. It is passed as UNTRUSTED DATA in the prompt - the LLM
+      # itself never receives FLEET_TOKEN.
+      - id: nl-fetch
+        if: steps.nl-gate.outputs.proceed == 'true'
+        env:
+          FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REPO: ${{ steps.nl-gate.outputs.repo }}
+          NUMBER: ${{ steps.nl-gate.outputs.number }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+        run: |
+          set -euo pipefail
+          slug="${GITHUB_REPOSITORY_OWNER}/${REPO}"
+          {
+            echo "<target-content repo=\"$slug\" number=\"$NUMBER\" kind=\"$KIND\">"
+            if [ "$KIND" = "issue-triage" ]; then
+              GH_TOKEN="$FLEET_TOKEN" gh issue view "$NUMBER" -R "$slug" \
+                --json title,body --jq '"# " + (.title // "") + "\n\n" + (.body // "")' \
+                || echo "(could not fetch issue)"
+            else
+              GH_TOKEN="$FLEET_TOKEN" gh pr view "$NUMBER" -R "$slug" \
+                --json title,body --jq '"# " + (.title // "") + "\n\n" + (.body // "")' || true
+              echo
+              echo "## Diff"
+              GH_TOKEN="$FLEET_TOKEN" gh pr diff "$NUMBER" -R "$slug" || echo "(could not fetch diff)"
+            fi
+            echo "</target-content>"
+          } > target.txt
+
+      - id: nl-prompt
+        if: steps.nl-gate.outputs.proceed == 'true'
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+          TARGET_FILE: target.txt
+        run: python scripts/apply_decision.py nl-prompt
+
+      # Claude maps intent -> writes decision.json. It is restricted to the
+      # Write tool (no Bash/gh, cannot run commands) and gets only this repo's
+      # token, never FLEET_TOKEN. Auth is the Claude subscription token, NOT an
+      # API key.
+      #
+      # NOTE: pin a specific release of this action when you turn nl_decisions on
+      # (see deep-review.yml for the same convention).
+      - name: Claude interprets intent
+        if: steps.nl-gate.outputs.proceed == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.nl-prompt.outputs.prompt }}
+          claude_args: |
+            --allowedTools Write
+            --max-turns 6
+
+      # Validate the LLM's structured result against the per-kind allowlist and
+      # emit deterministic outputs. `decision` is non-empty ONLY for a valid
+      # `action` mode - that is what makes the execute step below run.
+      - id: route
+        if: steps.nl-gate.outputs.proceed == 'true'
+        env:
+          DECISION_FILE: decision.json
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+        run: python scripts/apply_decision.py nl-route
+
+      # --- Act on the target (shared by every entry point) -------------------
+      - name: Mark processing
+        if: ${{ steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action' }}
+        uses: issue-ops/labeler@9210b145e254445abdbfd33099941e7637d56d4e # v4.0.0
+        with:
+          action: add
+          create: true
+          issue_number: ${{ github.event.issue.number }}
+          github_token: ${{ github.token }}
+          labels: processing
 
       # Execute on the TARGET repo. This is the ONLY step that uses FLEET_TOKEN.
       - id: execute
-        if: steps.decide.outputs.decision != ''
+        if: ${{ steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action' }}
         env:
           # Cross-repo actions require FLEET_TOKEN. Never the default token,
           # never printed.
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-          DECISION: ${{ steps.decide.outputs.decision }}
-          FREE_TEXT: ${{ steps.decide.outputs.free_text }}
-          TARGET_REPO: ${{ steps.decide.outputs.target_repo }}
-          TARGET_NUMBER: ${{ steps.decide.outputs.target_number }}
-          KIND: ${{ steps.decide.outputs.kind }}
-          HEAD_SHA: ${{ steps.decide.outputs.head_sha }}
+          DECISION: ${{ steps.decide.outputs.decision || steps.route.outputs.decision }}
+          FREE_TEXT: ${{ steps.decide.outputs.free_text || steps.route.outputs.free_text }}
+          TARGET_REPO: ${{ steps.decide.outputs.target_repo || steps.route.outputs.target_repo }}
+          TARGET_NUMBER: ${{ steps.decide.outputs.target_number || steps.route.outputs.target_number }}
+          KIND: ${{ steps.decide.outputs.kind || steps.route.outputs.kind }}
+          HEAD_SHA: ${{ steps.decide.outputs.head_sha || steps.route.outputs.head_sha }}
         run: python scripts/apply_decision.py execute
 
-      # Bookkeeping on the card itself, with the default token (no re-trigger).
-      - name: Finalize card
-        if: ${{ always() && steps.decide.outputs.decision != '' }}
+      # --- Finalize the card (this repo, default token; never re-triggers) ----
+      - name: Comment result on card
+        if: ${{ always() && (steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action') }}
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
           MESSAGE: ${{ steps.execute.outputs.result_message }}
-          TERMINAL: ${{ steps.execute.outputs.terminal_state }}
-        run: |
-          for l in resolved blocked processing; do
-            gh label create "$l" --force --color ededed >/dev/null 2>&1 || true
-          done
-          gh issue comment "$ISSUE" --body "${MESSAGE:-No actionable result.}" || true
-          gh issue edit "$ISSUE" --remove-label processing >/dev/null 2>&1 || true
-          case "$TERMINAL" in
-            resolved)
-              gh issue edit "$ISSUE" --add-label resolved --remove-label needs-decision >/dev/null 2>&1 || true
-              gh issue close "$ISSUE" || true
-              ;;
-            blocked)
-              gh issue edit "$ISSUE" --add-label blocked --remove-label needs-decision >/dev/null 2>&1 || true
-              ;;
-            *)
-              : # 'none'/'error': leave the card open; the comment above carries the result
-              ;;
-          esac
+        run: gh issue comment "$ISSUE" --body "${MESSAGE:-No actionable result.}" || true
+
+      - name: Clear processing label
+        if: ${{ always() && (steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action') }}
+        uses: issue-ops/labeler@9210b145e254445abdbfd33099941e7637d56d4e # v4.0.0
+        with:
+          action: remove
+          issue_number: ${{ github.event.issue.number }}
+          github_token: ${{ github.token }}
+          labels: processing
+
+      - name: Resolve card label
+        if: ${{ always() && steps.execute.outputs.terminal_state == 'resolved' }}
+        uses: issue-ops/labeler@9210b145e254445abdbfd33099941e7637d56d4e # v4.0.0
+        with:
+          action: add
+          create: true
+          issue_number: ${{ github.event.issue.number }}
+          github_token: ${{ github.token }}
+          labels: resolved
+
+      - name: Block card label
+        if: ${{ always() && steps.execute.outputs.terminal_state == 'blocked' }}
+        uses: issue-ops/labeler@9210b145e254445abdbfd33099941e7637d56d4e # v4.0.0
+        with:
+          action: add
+          create: true
+          issue_number: ${{ github.event.issue.number }}
+          github_token: ${{ github.token }}
+          labels: blocked
+
+      - name: Drop needs-decision on terminal
+        if: ${{ always() && (steps.execute.outputs.terminal_state == 'resolved' || steps.execute.outputs.terminal_state == 'blocked') }}
+        uses: issue-ops/labeler@9210b145e254445abdbfd33099941e7637d56d4e # v4.0.0
+        with:
+          action: remove
+          issue_number: ${{ github.event.issue.number }}
+          github_token: ${{ github.token }}
+          labels: needs-decision
+
+      - name: Close resolved card
+        if: ${{ always() && steps.execute.outputs.terminal_state == 'resolved' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue close "${{ github.event.issue.number }}" || true
+
+      # --- NL answer / clarify: post the reply, leave the card OPEN ----------
+      - name: Post NL reply
+        if: ${{ steps.route.outputs.mode == 'answer' || steps.route.outputs.mode == 'clarify' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPLY: ${{ steps.route.outputs.answer }}
+        run: gh issue comment "$ISSUE" --body "$REPLY" || true

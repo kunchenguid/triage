@@ -23,7 +23,7 @@ This repo is a **template**: fork it (or "Use this template"), edit one config f
 ```
 
 The deterministic core (ingest + decision-handler + scan-backstop) runs with a single secret and no LLM.
-A phase-2 `deep-review` add-on (optional, off by default) brings Claude in for code-grounded review.
+Two optional LLM side-jobs (both off by default) bring Claude in: `nl_decisions` lets you drive a card in plain English, and `deep_review` adds code-grounded review.
 
 ## Setup - a numbered checklist
 
@@ -52,7 +52,8 @@ repos:
     test_check_patterns: ["ci", "test"]
 
 maintainer: ""        # optional extra login allowed to drive decisions; default = repo owner
-deep_review: false    # phase-2 LLM side-job (leave false for the deterministic machine)
+deep_review: false    # LLM side-job: label -> read-only review verdict (off by default)
+nl_decisions: false   # LLM side-job: reply to a card in plain English (off by default)
 card_issues: false    # also card un-addressed issues, not just PRs (default: PRs only)
 ```
 
@@ -73,17 +74,23 @@ Only you can mint it (it's tied to your account).
 
 That is the only secret the deterministic machine needs.
 
-### 4. (Optional) Enable deep review
+### 4. (Optional) Enable the LLM side-jobs
 
 Skip this for the deterministic machine.
-To add Claude-powered review:
+Two independent Claude-powered features share one token, and both are **off** until you opt in:
 
-1. Set `deep_review: true` in `triage.config.yml`.
+- **`nl_decisions`** - reply to a decision card in plain English and Claude maps it onto the existing actions (see [Daily use](#daily-use)).
+- **`deep_review`** - apply the `needs-deep-review` label to a card and Claude posts a read-only merit/triage verdict.
+
+To enable either (or both):
+
+1. Set `nl_decisions: true` and/or `deep_review: true` in `triage.config.yml`.
 2. Generate a **Claude subscription** token (requires a Claude Pro/Max subscription): run `claude setup-token` in the Claude Code CLI.
-   This is **not** an Anthropic API key - the deep-review workflow authenticates `anthropics/claude-code-action` with your subscription only.
+   This is **not** an Anthropic API key - the workflows authenticate `anthropics/claude-code-action` with your subscription only.
 3. Add it as an Actions secret named exactly `CLAUDE_CODE_OAUTH_TOKEN`.
 
-Until both are in place, the `deep-review` workflow is completely inert.
+Each feature stays completely inert until **both** its flag is `true` **and** the token is present.
+In either case Claude only ever reads your own text as instructions, the target content is passed to it as untrusted data, and it is given only this repo's token (never `FLEET_TOKEN`) - it proposes; the deterministic handler disposes.
 
 ### 5. Onboard your repos
 
@@ -103,7 +110,7 @@ If nothing appears, see [Troubleshooting](#troubleshooting).
 
 ## Daily use
 
-You drive the queue two ways - whichever fits the decision:
+You drive the queue three ways - whichever fits the decision:
 
 - **Quick calls - tick a checkbox.** Each card offers the relevant boxes (e.g. *Merge it*, *Approve the CI run*, *Close / decline*, *Hold*). Tick exactly one; the handler executes it and closes the card.
 - **Nuanced calls - comment a slash-command.** Reply on the card with one of:
@@ -113,9 +120,15 @@ You drive the queue two ways - whichever fits the decision:
   - `/decline <reason>` - post your reason on the target, then close it.
   - `/hold` - park the card (labels it `blocked`, leaves it for you to handle manually).
   - `/comment <text>` - post your comment to the target and leave the card open.
+- **Plain English - just reply (opt-in).** When you turn on `nl_decisions` (see [step 4](#4-optional-enable-the-llm-side-jobs)), reply to a card in normal language and Claude maps what you meant onto the same actions above. It does one of three things:
+  - **Acts** when you're clearly deciding - "merge it", "close this, it's superseded by #50", "decline because the approach is wrong". It runs that action on the target and closes the card, exactly as the slash-command would (same guards: per-kind allowlist, head-SHA re-check, fork-CI HOLD).
+  - **Answers** when you're asking - "why is this safe to merge?", "what's the risk here?". It reads the target (diff/issue) and replies on the card, and **leaves the card open** so you can keep the thread going.
+  - **Asks you to confirm** when it's unsure - so an ambiguous comment gets a reply instead of silence.
+
+  Claude only ever *maps* your comment to a structured choice; the deterministic handler performs any action, so nothing happens that a slash-command couldn't already do. Only your own comments are ever read (a stranger's are ignored). A comment that starts with `/` is always treated as a slash-command, never sent to Claude. If Claude can't form a useful result, it asks you to rephrase or use a slash-command.
 
 An item is **consumed** when the handler closes its card after acting; the card is labeled `resolved` (or `blocked` for a hold) for audit.
-If a PR's head moves after a card is created, a `/merge` is safely refused with a note so you re-check before merging.
+If a PR's head moves after a card is created, a `/merge` (or a "merge it" comment) is safely refused with a note so you re-check before merging.
 The scheduled backstop also self-heals: if the underlying PR/issue gets merged or closed elsewhere, its card is closed automatically on the next scan.
 
 ## Security notes
@@ -123,7 +136,7 @@ The scheduled backstop also self-heals: if the underlying PR/issue gets merged o
 - **Owner-only acting.** Anyone can open issues or comment on a public repo, but every acting path is owner-gated (`sender == repository_owner`, plus an optional `maintainer` override). Strangers' edits and comments are no-ops.
 - **Token scope.** The default `GITHUB_TOKEN` only reaches this repo and is used for all card activity (so it can't recursively re-trigger the handler). Acting on your other repos uses `FLEET_TOKEN`, which is never printed and only ever used in the one cross-repo step. Scope it to just your fleet.
 - **Fork-CI / pwn-request HOLD.** Approving a fork PR's CI runs that PR's own workflow/action code with your permissions. Any approval that touches `.github/workflows`, `.github/actions`, or `action.yml`/`action.yaml` is **held** for manual review, never auto-approved (it fails closed if the file list can't be read).
-- **LLM injection defense (phase 2).** Only your own card text ever reaches the LLM as instructions; the target diff/issue is passed as clearly-delimited untrusted data, and the LLM gets only this repo's token to post a comment - never `FLEET_TOKEN`, never write access to a fleet repo.
+- **LLM injection defense (both LLM side-jobs).** Only your own text ever reaches the LLM as instructions; the target diff/issue is passed as clearly-delimited untrusted data, and the LLM is never given `FLEET_TOKEN` or write access to a fleet repo. For `nl_decisions` the LLM only *maps* your comment to a structured choice that is re-validated against the per-kind action allowlist before the deterministic handler acts - so a prompt-injection in a target diff cannot make it merge or close anything you didn't ask for, and it is further restricted to a single file-writing tool (no shell, no `gh`).
 - **Public = world-readable.** A public triage repo makes your queue and decisions visible to everyone. That transparency is a feature, but state it plainly to yourself before listing private work here; use a private repo if you need it.
 - **Least privilege.** Every workflow declares a minimal `permissions:` block, and each card is serialized with per-issue `concurrency` so concurrent ticks can't race.
 
@@ -141,6 +154,8 @@ The scheduled backstop also self-heals: if the underlying PR/issue gets merged o
   A `/merge` that's refused with a "head moved" note is working as intended - re-scan and decide again.
 - **Cron lag.**
   Scheduled runs are best-effort and can be delayed by GitHub. For real-time items, wire the dispatch path from [`docs/ONBOARDING.md`](docs/ONBOARDING.md); the backstop is only the safety net.
+- **A plain-English reply did nothing / I only get slash-commands.**
+  `nl_decisions` is inert unless `nl_decisions: true` **and** `CLAUDE_CODE_OAUTH_TOKEN` is set; the handler logs `nl path inert (...)` showing which condition is missing. Comments from anyone but the owner (or configured `maintainer`) are ignored, and a comment that starts with `/` is always treated as a slash-command.
 - **Deep review does nothing.**
   It's inert unless `deep_review: true` **and** `CLAUDE_CODE_OAUTH_TOKEN` is set. The gate step logs which condition is missing.
 
@@ -148,16 +163,19 @@ The scheduled backstop also self-heals: if the underlying PR/issue gets merged o
 
 ```
 triage.config.yml              the one file you edit
+.github/ISSUE_TEMPLATE/
+  triage-decision.yml          schema for the machine-rendered cards (lets issue-ops/parser read the checkboxes)
 .github/workflows/
   ingest.yml                   repository_dispatch / manual -> create or update a decision card
-  decision-handler.yml         your tick / comment -> execute on the target repo -> close the card
+  decision-handler.yml         your tick / slash-command / plain-English reply -> execute on the target -> close the card
   scan-backstop.yml            scheduled scan -> reconcile the queue against live repo state
-  deep-review.yml              (phase 2, inert) label -> Claude reviews the target -> comments back
+  deep-review.yml              (LLM side-job, inert) label -> Claude reviews the target -> comments back
 scripts/
   triage_core.py               GraphQL scan, classify, dedup/overlap, security-gated CI approval
   render_card.py               build the decision card; create/update/close cards in this repo
-  apply_decision.py            parse a tick/slash/label, execute it on the target repo
+  apply_decision.py            parse a tick/slash/label/plain-English comment, execute it on the target repo
   build_item.py                normalize a dispatch payload into a card item
   reconcile.py                 backstop: open new cards, close stale ones
+tests/test_decision.py         offline unit test for the parse/route logic (mocks the LLM)
 docs/ONBOARDING.md             how to wire a source repo's dispatch (the fast path)
 ```
