@@ -85,6 +85,7 @@ jobs:
       (
         github.event_name == 'issues' &&
         github.event.label.name == 'needs-deep-review' &&
+        github.triggering_actor == github.repository_owner &&
         (
           github.event.sender.login == github.repository_owner ||
           github.actor == github.repository_owner

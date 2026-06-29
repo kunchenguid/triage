@@ -21,9 +21,10 @@ so these tests pin the *wiring* instead:
     receives FLEET_TOKEN; the verdict is posted with the default token;
   * prompt boundary: the mutable decision card, target diff/issue text, and
     target code are all presented as delimited untrusted data;
-  * investigate trigger: decision-handler.yml has `actions: write` and an
-    Investigate step that clears the box and dispatches deep-review.yml via
-    workflow_dispatch on the default token, carrying the parsed target binding.
+  * investigate trigger: decision-handler.yml keeps `actions: write` only on an
+    Investigate dispatch job that clears the box and dispatches deep-review.yml
+    via workflow_dispatch on the default token, carrying the parsed target
+    binding.
 """
 import os
 import sys
@@ -131,6 +132,10 @@ def test_workflow_dispatch_gate_restricts_bot_reruns():
     check("workflow: manual needs-deep-review label arm remains owner-only",
           "github.event.label.name == 'needs-deep-review'" in gate
           and "github.event.sender.login == github.repository_owner" in gate)
+    check("workflow: manual needs-deep-review label reruns require the owner",
+          "github.event_name == 'issues' && "
+          "github.event.label.name == 'needs-deep-review' && "
+          "github.triggering_actor == github.repository_owner" in squashed)
 
 
 # --------------------------------------------------------------------------- #
@@ -239,14 +244,22 @@ def test_workflow_dispatch_uses_immutable_target_inputs():
               "git -C target-src rev-parse HEAD" in str(verify.get("run", ""))
               and "steps.resolve.outputs.head_sha" in yaml.safe_dump(verify))
 
+    check("handler: handle exposes the parsed target repo",
+          "target_repo: ${{ steps.decide.outputs.target_repo }}" in dh)
+    check("handler: handle exposes the parsed target number",
+          "target_number: ${{ steps.decide.outputs.target_number }}" in dh)
+    check("handler: handle exposes the parsed target kind",
+          "kind: ${{ steps.decide.outputs.kind }}" in dh)
+    check("handler: handle exposes the captured head SHA",
+          "head_sha: ${{ steps.decide.outputs.head_sha }}" in dh)
     check("handler: investigate dispatch passes target repo",
-          '-f repo="$TARGET_REPO"' in dh and "steps.decide.outputs.target_repo" in dh)
+          '-f repo="$TARGET_REPO"' in dh and "TARGET_REPO: ${{ needs.handle.outputs.target_repo }}" in dh)
     check("handler: investigate dispatch passes target number",
-          '-f number="$TARGET_NUMBER"' in dh and "steps.decide.outputs.target_number" in dh)
+          '-f number="$TARGET_NUMBER"' in dh and "TARGET_NUMBER: ${{ needs.handle.outputs.target_number }}" in dh)
     check("handler: investigate dispatch passes target kind",
-          '-f kind="$TARGET_KIND"' in dh and "steps.decide.outputs.kind" in dh)
+          '-f kind="$TARGET_KIND"' in dh and "TARGET_KIND: ${{ needs.handle.outputs.kind }}" in dh)
     check("handler: investigate dispatch passes captured head SHA",
-          '-f head_sha="$HEAD_SHA"' in dh and "steps.decide.outputs.head_sha" in dh)
+          '-f head_sha="$HEAD_SHA"' in dh and "HEAD_SHA: ${{ needs.handle.outputs.head_sha }}" in dh)
     check("handler: investigate no longer dispatches issue-only",
           'workflow run deep-review.yml -f issue="$ISSUE"' not in dh)
 
@@ -257,13 +270,39 @@ def test_workflow_dispatch_uses_immutable_target_inputs():
 def test_handler_investigate_wiring():
     dh_text = read(".github", "workflows", "decision-handler.yml")
     doc = load_yaml(".github", "workflows", "decision-handler.yml")
-    perms = doc["jobs"]["handle"].get("permissions") or doc.get("permissions") or {}
-    # permissions can be at job or workflow level; this workflow sets it at top.
     top_perms = doc.get("permissions") or {}
-    check("handler: has actions: write to dispatch the investigation",
-          top_perms.get("actions") == "write" or perms.get("actions") == "write")
+    handle = doc["jobs"]["handle"]
+    dispatch = doc["jobs"].get("investigate-dispatch")
 
-    steps = steps_of(doc, "handle")
+    check("handler: workflow scope does NOT grant actions: write",
+          top_perms.get("actions") != "write")
+    check("handler: handle job does NOT grant actions: write",
+          (handle.get("permissions") or {}).get("actions") != "write")
+    action_jobs = [name for name, job in doc["jobs"].items()
+                   if (job.get("permissions") or {}).get("actions") == "write"]
+    check("handler: only the investigate job has actions: write",
+          action_jobs == ["investigate-dispatch"])
+    check("handler: investigate dispatch job exists", dispatch is not None)
+
+    if dispatch:
+        perms = dispatch.get("permissions") or {}
+        check("handler: investigate job can dispatch workflows",
+              perms.get("actions") == "write"
+              and perms.get("issues") == "write"
+              and perms.get("contents") == "read")
+        check("handler: investigate job depends on handle",
+              dispatch.get("needs") == "handle")
+        job_if = str(dispatch.get("if", ""))
+        check("handler: investigate job is owner-gated",
+              "needs.handle.outputs.authorized == 'true'" in job_if)
+        check("handler: investigate job is non-consuming-output gated",
+              "needs.handle.outputs.investigate != ''" in job_if)
+
+    handle_steps = steps_of(doc, "handle")
+    check("handler: handle job does NOT dispatch deep-review",
+          "workflow run deep-review.yml" not in yaml.safe_dump(handle_steps))
+
+    steps = steps_of(doc, "investigate-dispatch") if dispatch else []
     inv = next((s for s in steps if "investigate" in str(s.get("name", "")).lower()), None)
     check("handler: an Investigate step exists", inv is not None)
     if inv:
@@ -285,8 +324,8 @@ def test_handler_investigate_wiring():
         check("handler: investigate runs on the default token (no FLEET_TOKEN)",
               "github.token" in str(inv.get("env", {}).get("GH_TOKEN", ""))
               and "FLEET_TOKEN" not in yaml.safe_dump(inv))
-    check("handler: investigate step is owner-gated",
-          inv is not None and "authorized == 'true'" in str(inv.get("if", "")))
+    check("handler: investigate uses the handle job output for the checkbox",
+          inv is not None and "needs.handle.outputs.investigate" in yaml.safe_dump(inv.get("env", {})))
     # The consuming execute path must NOT fire for an investigate-only event.
     check("handler: parse routes investigate to the `investigate` output",
           "steps.decide.outputs.investigate" in dh_text)
