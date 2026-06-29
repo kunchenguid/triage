@@ -24,10 +24,12 @@ These tests cover:
     re-approved), default-on, explicit opt-out, and the per-repo override.
 """
 import io
+import json
 import os
 import sys
 import tempfile
 from contextlib import redirect_stderr
+from types import SimpleNamespace
 
 import yaml
 
@@ -358,6 +360,54 @@ def test_approve_exception_falls_back_to_card():
     check("route: approve was attempted", len(calls["approve"]) == 1)
 
 
+def run_approve_ci(run_list_result, approval_results=None):
+    approval_results = list(approval_results or [])
+
+    def fake_run(cmd, capture_output=True, text=True):
+        if cmd[:3] == ["gh", "api", "/repos/o/r/pulls/1"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"head": {"ref": "feature"}}), stderr="")
+        if cmd[:3] == ["gh", "run", "list"]:
+            return run_list_result
+        if cmd[:3] == ["gh", "api", "--method"]:
+            return approval_results.pop(0)
+        raise AssertionError(cmd)
+
+    save = (core.subprocess.run, core.ci_safety)
+    core.subprocess.run = fake_run
+    core.ci_safety = lambda slug, pr, posture: SAFE_VERDICT
+    try:
+        return core.approve_ci("o", "r", "1", posture=CLEAN_POSTURE)
+    finally:
+        core.subprocess.run, core.ci_safety = save
+
+
+def test_approve_ci_run_list_failure_returns_error():
+    status, message = run_approve_ci(SimpleNamespace(returncode=1, stdout="", stderr="rate limited"))
+    check("approve_ci: run-list failure -> error", status == "error")
+    check("approve_ci: run-list failure mentions cause", "rate limited" in message)
+
+
+def test_approve_ci_invalid_run_list_returns_error():
+    status, message = run_approve_ci(SimpleNamespace(returncode=0, stdout="not-json", stderr=""))
+    check("approve_ci: invalid run-list JSON -> error", status == "error")
+    check("approve_ci: invalid run-list JSON mentions cause", "invalid JSON" in message)
+
+
+def test_approve_ci_any_failed_post_returns_error():
+    runs = [
+        {"databaseId": 123, "workflowName": "CI"},
+        {"databaseId": 124, "workflowName": "Lint"},
+    ]
+    approvals = [
+        SimpleNamespace(returncode=0, stdout="", stderr=""),
+        SimpleNamespace(returncode=1, stdout="", stderr="forbidden"),
+    ]
+    status, message = run_approve_ci(SimpleNamespace(returncode=0, stdout=json.dumps(runs), stderr=""),
+                                     approvals)
+    check("approve_ci: any failed approval POST -> error", status == "error")
+    check("approve_ci: failed approval POST is named", "Lint:forbidden" in message)
+
+
 def test_opt_out_global_disables_auto_approve():
     result, items, calls = run_build_repo([needs_ci_pr()], auto_approve_ci=False)
     check("opt-out: safe PR STILL raises a card", len(items) == 1)
@@ -470,6 +520,9 @@ def main():
     test_approve_failure_falls_back_to_card()
     test_approve_hold_falls_back_to_card()
     test_approve_exception_falls_back_to_card()
+    test_approve_ci_run_list_failure_returns_error()
+    test_approve_ci_invalid_run_list_returns_error()
+    test_approve_ci_any_failed_post_returns_error()
     test_opt_out_global_disables_auto_approve()
     test_opt_out_card_still_carries_pr_target_warning()
     test_per_repo_override_disables_auto_approve()

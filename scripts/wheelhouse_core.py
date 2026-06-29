@@ -728,17 +728,43 @@ def approve_ci(owner, repo, pr, posture=None):
         ["gh", "run", "list", "--branch", head_ref, "--status", "action_required",
          "--limit", "30", "-R", slug, "--json", "databaseId,workflowName"],
         capture_output=True, text=True)
-    runs = json.loads(lst.stdout) if lst.returncode == 0 and lst.stdout.strip() else []
+    if lst.returncode != 0:
+        return ("error", "#%s (%s): workflow run list failed: %s%s"
+                % (pr, head_ref, lst.stderr.strip()[:160], warn))
+    if not lst.stdout.strip():
+        return ("error", "#%s (%s): workflow run list returned no output%s"
+                % (pr, head_ref, warn))
+    try:
+        runs = json.loads(lst.stdout)
+    except ValueError:
+        return ("error", "#%s (%s): workflow run list returned invalid JSON%s"
+                % (pr, head_ref, warn))
+    if not isinstance(runs, list):
+        return ("error", "#%s (%s): workflow run list returned unexpected data%s"
+                % (pr, head_ref, warn))
     if not runs:
         return ("noop", "#%s (%s): no workflow runs awaiting approval%s" % (pr, head_ref, warn))
 
     done = []
+    failed = []
     for run in runs:
+        if not isinstance(run, dict) or not run.get("databaseId"):
+            return ("error", "#%s (%s): workflow run list returned an entry without databaseId%s"
+                    % (pr, head_ref, warn))
         rid = run["databaseId"]
         ar = subprocess.run(
             ["gh", "api", "--method", "POST", "/repos/%s/actions/runs/%s/approve" % (slug, rid)],
             capture_output=True, text=True)
-        done.append("%s:%s" % (run.get("workflowName", "?"), "OK" if ar.returncode == 0 else "FAIL"))
+        name = run.get("workflowName", "?")
+        if ar.returncode == 0:
+            done.append("%s:OK" % name)
+        else:
+            done.append("%s:FAIL" % name)
+            failed.append("%s:%s" % (name, ar.stderr.strip()[:160] or "approval failed"))
+    if failed:
+        return ("error", "#%s (%s): approved %d/%d run(s), failed [%s] [%s]%s"
+                % (pr, head_ref, len(runs) - len(failed), len(runs),
+                   ", ".join(failed), ", ".join(done), warn))
     return ("approved", "#%s (%s): approved %d run(s) [%s]%s"
             % (pr, head_ref, len(runs), ", ".join(done), warn))
 
