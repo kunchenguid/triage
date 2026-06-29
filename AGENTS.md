@@ -174,7 +174,10 @@ still appears where it's plain English, e.g. "triage the queue".)
   here). `workflow_dispatch` via `github.token` IS the documented exception to
   recursion-prevention, so it reliably fires; that is why decision-handler needs
   `actions: write`. The manual `needs-deep-review` label path is unchanged (a
-  human applying it raises the `labeled` event normally). `investigate` is in the
+  human applying it raises the `labeled` event normally).
+  This is a deliberate asymmetry: the manual `needs-deep-review` label path authorizes only the repository owner.
+  A configured co-maintainer uses the Investigate checkbox, which runs through the maintainer-gated decision-handler (`wheelhouse_core.maintainers()` = owner + configured maintainer).
+  `investigate` is in the
   per-kind `ALLOWED` set but is filtered out of the NL verb list/validation
   (`nl_allowed`): an investigation is a deliberate click, not free-text intent, so
   the NL path neither offers nor accepts it.
