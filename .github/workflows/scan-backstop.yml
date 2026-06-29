@@ -16,7 +16,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: triage-backstop
+  group: wheelhouse-backstop
   cancel-in-progress: false
 
 jobs:
@@ -38,7 +38,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        run: python scripts/triage_core.py scan > scan.json
+        run: python scripts/wheelhouse_core.py scan > scan.json
 
       # Current open cards in THIS repo - default token.
       - name: List open cards

@@ -1,11 +1,13 @@
-# Triage Hub
+# Wheelhouse
+
+> A ship's **wheelhouse** is where the captain stands to steer. This is your wheelhouse for open-source maintenance: whatever across your repos needs *your* hand surfaces here, and you make the call.
 
 A personal, always-on, cross-repo **"what needs my decision"** command center, built entirely on GitHub Issues + GitHub Actions.
 Every issue in this repo is one pending decision about the repositories you maintain - a PR worth merging, a fork-CI run worth approving, an issue worth triaging.
 You answer by ticking a checkbox or replying in plain English; a workflow executes your call on the real repo and closes the card.
 No server, no database, no bot to host - just this repo and a couple of secrets.
 
-This repo is a **template**: fork it (or "Use this template"), edit one config file, add one secret, and you have your own triage machine.
+This repo is a **template**: fork it (or "Use this template"), edit one config file, add one secret, and you have your own Wheelhouse.
 
 ## How it works
 
@@ -28,7 +30,7 @@ Two optional LLM side-jobs (both off by default) bring Claude in: `nl_decisions`
 ## Setup - a numbered checklist
 
 Follow these top to bottom.
-You only ever edit **one file** (`triage.config.yml`) and add **one secret** (`FLEET_TOKEN`).
+You only ever edit **one file** (`wheelhouse.config.yml`) and add **one secret** (`FLEET_TOKEN`).
 
 ### 1. Fork or "Use this template"
 
@@ -36,7 +38,7 @@ Click **Use this template** ▸ **Create a new repository** (or fork).
 Keeping it **public** makes your decisions world-readable - a transparency feature; see [Security notes](#security-notes).
 A **private** repo works too, in which case `FLEET_TOKEN` must also be able to read this repo's issues.
 
-### 2. Edit `triage.config.yml`
+### 2. Edit `wheelhouse.config.yml`
 
 This is the only file you edit.
 The owner is **not** set here - every workflow derives it from `github.repository_owner`, so the file works unchanged on your account.
@@ -59,7 +61,7 @@ card_issues: false    # also card un-addressed issues, not just PRs (default: PR
 
 Not sure what your check names are?
 After step 6, run the `scan-backstop` workflow and read its logs, or use the `checks` helper locally:
-`GITHUB_REPOSITORY_OWNER=<you> GH_TOKEN=<token> python scripts/triage_core.py checks my-service`.
+`GITHUB_REPOSITORY_OWNER=<you> GH_TOKEN=<token> python scripts/wheelhouse_core.py checks my-service`.
 
 ### 3. Create a `FLEET_TOKEN`
 
@@ -67,7 +69,7 @@ This is the token the machine uses to act on your other repos.
 Only you can mint it (it's tied to your account).
 
 1. GitHub ▸ **Settings** ▸ **Developer settings** ▸ **Personal access tokens** ▸ **Fine-grained tokens** ▸ **Generate new token**.
-2. **Repository access** ▸ **Only select repositories** ▸ pick every repo you listed in `triage.config.yml` (and this repo too, if it is private).
+2. **Repository access** ▸ **Only select repositories** ▸ pick every repo you listed in `wheelhouse.config.yml` (and this repo too, if it is private).
 3. **Permissions** ▸ Repository permissions: **Contents → Read and write**, **Issues → Read and write**, **Pull requests → Read and write**.
 4. Generate, copy the token.
 5. In **this** repo: **Settings** ▸ **Secrets and variables** ▸ **Actions** ▸ **New repository secret** ▸ name it exactly `FLEET_TOKEN`, paste the value.
@@ -84,7 +86,7 @@ Two independent Claude-powered features share one token, and both are **off** un
 
 To enable either (or both):
 
-1. Set `nl_decisions: true` and/or `deep_review: true` in `triage.config.yml`.
+1. Set `nl_decisions: true` and/or `deep_review: true` in `wheelhouse.config.yml`.
 2. Generate a **Claude subscription** token (requires a Claude Pro/Max subscription): run `claude setup-token` in the Claude Code CLI.
    This is **not** an Anthropic API key - the workflows authenticate `anthropics/claude-code-action` with your subscription only.
 3. Add it as an Actions secret named exactly `CLAUDE_CODE_OAUTH_TOKEN`.
@@ -137,13 +139,13 @@ The scheduled backstop also self-heals: if the underlying PR/issue gets merged o
 - **Token scope.** The default `GITHUB_TOKEN` only reaches this repo and is used for all card activity (so it can't recursively re-trigger the handler). Acting on your other repos uses `FLEET_TOKEN`, which is never printed and only ever used in the one cross-repo step. Scope it to just your fleet.
 - **Fork-CI / pwn-request HOLD.** Approving a fork PR's CI runs that PR's own workflow/action code with your permissions. Any approval that touches `.github/workflows`, `.github/actions`, or `action.yml`/`action.yaml` is **held** for manual review, never auto-approved (it fails closed if the file list can't be read).
 - **LLM injection defense (both LLM side-jobs).** Only your own text ever reaches the LLM as instructions; the target diff/issue is passed as clearly-delimited untrusted data, and the LLM is never given `FLEET_TOKEN` or write access to a fleet repo. For `nl_decisions` the LLM only *maps* your comment to a structured choice that is re-validated against the per-kind action allowlist before the deterministic handler acts - so a prompt-injection in a target diff cannot make it merge or close anything you didn't ask for, and it is further restricted to a single file-writing tool (no shell, no `gh`).
-- **Public = world-readable.** A public triage repo makes your queue and decisions visible to everyone. That transparency is a feature, but state it plainly to yourself before listing private work here; use a private repo if you need it.
+- **Public = world-readable.** A public Wheelhouse repo makes your queue and decisions visible to everyone. That transparency is a feature, but state it plainly to yourself before listing private work here; use a private repo if you need it.
 - **Least privilege.** Every workflow declares a minimal `permissions:` block, and each card is serialized with per-issue `concurrency` so concurrent ticks can't race.
 
 ## Troubleshooting
 
 - **Nothing shows up in the queue.**
-  Check that `FLEET_TOKEN` exists and is scoped to the repos in `triage.config.yml` (Settings ▸ Secrets and variables ▸ Actions).
+  Check that `FLEET_TOKEN` exists and is scoped to the repos in `wheelhouse.config.yml` (Settings ▸ Secrets and variables ▸ Actions).
   Confirm the repo names in the config are correct (names only, no `owner/` prefix).
   Run `scan-backstop` manually and read the logs - a repo that can't be read is reported as a warning and skipped, not fatal.
 - **Items look wrong (a non-compliant PR shows as merge-ready).**
@@ -162,16 +164,16 @@ The scheduled backstop also self-heals: if the underlying PR/issue gets merged o
 ## Repo layout
 
 ```
-triage.config.yml              the one file you edit
+wheelhouse.config.yml          the one file you edit
 .github/ISSUE_TEMPLATE/
-  triage-decision.yml          schema for the machine-rendered cards (lets issue-ops/parser read the checkboxes)
+  wheelhouse-decision.yml      schema for the machine-rendered cards (lets issue-ops/parser read the checkboxes)
 .github/workflows/
   ingest.yml                   repository_dispatch / manual -> create or update a decision card
   decision-handler.yml         your tick / slash-command / plain-English reply -> execute on the target -> close the card
   scan-backstop.yml            scheduled scan -> reconcile the queue against live repo state
   deep-review.yml              (LLM side-job, inert) label -> Claude reviews the target -> comments back
 scripts/
-  triage_core.py               GraphQL scan, classify, dedup/overlap, security-gated CI approval
+  wheelhouse_core.py           GraphQL scan, classify, dedup/overlap, security-gated CI approval
   render_card.py               build the decision card; create/update/close cards in this repo
   apply_decision.py            parse a tick/slash/label/plain-English comment, execute it on the target repo
   build_item.py                normalize a dispatch payload into a card item
@@ -193,7 +195,7 @@ It leans on an established pattern rather than inventing one, and credits the pe
 ### Where this machine sits in the pattern
 
 Canonical IssueOps is *a human submits a form -> parse -> validate -> act*.
-Triage Hub is the **approval half** of that loop with an **automated front-end**: instead of you filling in a form, the scan/ingest workflows generate the decision cards, and you approve or deny them.
+Wheelhouse is the **approval half** of that loop with an **automated front-end**: instead of you filling in a form, the scan/ingest workflows generate the decision cards, and you approve or deny them.
 State lives in GitHub exactly as IssueOps intends - an open issue is a pending decision, a closed one is consumed, and labels carry the state in between.
 
 ### Lifecycle mapping

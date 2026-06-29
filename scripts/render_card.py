@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Triage Hub - decision-card renderer + card operations.
+Wheelhouse - decision-card renderer + card operations.
 
 `render(item)` turns one classified item into a decision card: a human-readable
 body with quick-decision checkboxes and a hidden machine-readable state block.
@@ -110,7 +110,7 @@ def render(item):
     lines.append("<sub>Only the repository owner can drive this decision - everyone "
                  "else's edits and comments are ignored.</sub>")
     lines.append("")
-    lines.append("<!-- triage-state: %s -->" % json.dumps(state, separators=(",", ":")))
+    lines.append("<!-- wheelhouse-state: %s -->" % json.dumps(state, separators=(",", ":")))
     body = "\n".join(lines)
 
     return {"title": issue_title, "body": body, "labels": card_labels(item),

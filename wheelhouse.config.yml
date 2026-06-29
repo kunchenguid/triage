@@ -1,4 +1,4 @@
-# triage.config.yml
+# wheelhouse.config.yml
 # =============================================================================
 # THE one file you edit to own this machine.
 #
@@ -7,7 +7,7 @@
 # account that forks or "Use this template"s the repo. List only repo *names*
 # (no "owner/" prefix) - they are resolved under your account/org.
 #
-# After editing this file and adding the FLEET_TOKEN secret, your triage machine
+# After editing this file and adding the FLEET_TOKEN secret, your Wheelhouse
 # is live. See README.md for the full setup checklist.
 # =============================================================================
 

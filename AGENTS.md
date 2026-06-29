@@ -1,18 +1,23 @@
 # Project agent memory
 
-Triage Hub - a portable, forkable IssueOps machine. Issues in this repo are a
+Wheelhouse - a portable, forkable IssueOps machine. Issues in this repo are a
 human-in-the-loop decision queue for cross-repo OSS maintenance, driven entirely
 by GitHub Actions. This file holds durable, project-intrinsic notes.
+
+The name: a ship's wheelhouse is where the captain steers. This repo is where
+you steer your open-source maintenance - what needs your hand surfaces as a card
+and you make the call. (The product is "Wheelhouse"; the generic verb "triage"
+still appears where it's plain English, e.g. "triage the queue".)
 
 ## Non-negotiable invariants
 
 - **Portability / fork-and-own.** Never hardcode an owner or repo name in
   workflows or scripts. Owner is always `github.repository_owner` (env
   `GITHUB_REPOSITORY_OWNER`); the fleet + policy come from the single root file
-  `triage.config.yml`. A fork on any account must work after editing only that
+  `wheelhouse.config.yml`. A fork on any account must work after editing only that
   file and adding the secrets.
 - **Security.** Owner-gate every acting path (`sender == repository_owner`, plus
-  optional `maintainer` override via `triage_core.py authorized`). Cross-repo
+  optional `maintainer` override via `wheelhouse_core.py authorized`). Cross-repo
   actions use `FLEET_TOKEN`; everything that touches THIS repo's cards uses the
   default `GITHUB_TOKEN` (this is also what prevents the decision-handler from
   re-triggering itself - GitHub does not raise workflow events for
@@ -26,21 +31,24 @@ by GitHub Actions. This file holds durable, project-intrinsic notes.
 - **State lives in GitHub, not on disk.** Open issue = pending decision; closed =
   consumed. Labels are state (`needs-decision`, `processing`, `resolved`,
   `blocked`, `repo:*`, `kind:*`, `priority:*`). A hidden
-  `<!-- triage-state: {...} -->` block in each card body carries
-  `{repo, number, kind, head_sha, options}`. The local lock/board/ledger from
-  the original `triage.py` are intentionally dropped (replaced by Actions
+  `<!-- wheelhouse-state: {...} -->` block in each card body carries
+  `{repo, number, kind, head_sha, options}`. `render_card.py` writes that marker,
+  but `parse_state_block` also accepts the legacy `<!-- triage-state: ... -->`
+  marker (cards rendered before the rename) - back-compat that must stay so a live
+  queue keeps working. The local lock/board/ledger from the original `triage.py`
+  are intentionally dropped (replaced by Actions
   `concurrency` + issues/labels/comments).
 - **Workflows:** `ingest` (dispatch/manual -> upsert a card), `decision-handler`
   (tick/slash/**plain-English** -> act on target -> consume card), `scan-backstop`
   (scheduled scan -> reconcile), `deep-review` (phase 2, inert).
-- **Scripts:** `triage_core.py` (scan/classify/dedup/security gate + shared utils
+- **Scripts:** `wheelhouse_core.py` (scan/classify/dedup/security gate + shared utils
   `parse_state_block`, `authorized`, `state`, `nl-decisions-enabled`),
   `render_card.py` (render + card CRUD), `apply_decision.py` (deterministic
   `parse` then `execute`, plus the natural-language `nl-eligible`/`nl-prompt`/
   `nl-route` that map an owner's free-text comment to a structured intent),
   `build_item.py` (normalize ingest payload), `reconcile.py` (backstop
-  create/close). `render_card`/`apply_decision`/`reconcile`/`build_item` import
-  `triage_core` via `sys.path.insert(0, dirname(__file__))`.
+  create/close). `apply_decision`/`reconcile` import `wheelhouse_core` (and
+  `build_item` imports `render_card`) via `sys.path.insert(0, dirname(__file__))`.
 - **Reusable actions (pinned to full SHAs).** `decision-handler` delegates two
   mechanical jobs to the `issue-ops` toolkit instead of hand-rolling them:
   `issue-ops/parser` renders the card's checkboxes as `{selected, unselected}`
@@ -58,7 +66,7 @@ by GitHub Actions. This file holds durable, project-intrinsic notes.
   find the newly-ticked option (the marker survives because the parser strips
   only the `- [x] ` prefix), and parses slash-commands against the kind's allowed
   set. Don't reformat them away.
-- `.github/ISSUE_TEMPLATE/triage-decision.yml` is load-bearing, not cosmetic:
+- `.github/ISSUE_TEMPLATE/wheelhouse-decision.yml` is load-bearing, not cosmetic:
   `issue-ops/parser` only returns `{selected, unselected}` when a template marks
   the section as a `checkboxes` field, and it matches the section by EXACT heading
   text. Its `checkboxes` label MUST stay `"Your decision"` to match the
@@ -88,7 +96,7 @@ by GitHub Actions. This file holds durable, project-intrinsic notes.
   `github.token`) and `apply_decision.py assemble_history` renders it as a
   "Conversation so far" block of trusted context - but ONLY comments authored by
   a maintainer or by the workflow bot (`github-actions[bot]`, the assistant's own
-  prior turns) survive. The maintainer set is exactly `triage_core.maintainers()`
+  prior turns) survive. The maintainer set is exactly `wheelhouse_core.maintainers()`
   (repo owner + optional configured `maintainer`) - the SAME notion the
   `gate`/`authorized` path uses; do not invent a second rule. Every other author
   (a contributor, a third-party bot) is dropped ENTIRELY so non-owner text can
@@ -98,9 +106,15 @@ by GitHub Actions. This file holds durable, project-intrinsic notes.
   this widens the trust model: the LLM is still `--allowedTools Write`, still gets
   only this repo's token (never `FLEET_TOKEN`), and `nl-route`'s allowlist
   re-validation is unchanged.
-- `triage_core.py scan` is resilient: a repo that fails to read is reported as a
+- `wheelhouse_core.py scan` is resilient: a repo that fails to read is reported as a
   warning (`ok:false`) and skipped, and `reconcile.py` must never close cards for
   an `ok:false` repo (state unknown).
+- The `repository_dispatch` event type is `wheelhouse-item`, but `ingest.yml`
+  also listens for the legacy `triage-item` (`types: [wheelhouse-item,
+  triage-item]`). It is a cross-repo wire contract: source repos onboarded before
+  the rename still send `triage-item`, so the alias must stay until every source
+  dispatcher is updated. Same idea as the state-marker back-compat - rename the
+  name, keep accepting the old one.
 
 ## LLM side-jobs (both opt-in, both off by default)
 
@@ -126,7 +140,7 @@ repo's token):
 
 No build step. Validate with `python -m py_compile scripts/*.py tests/*.py`, run
 the decision unit test (`python tests/test_decision.py` - mocks the LLM, no
-network), and YAML-parse `.github/workflows/*.yml` + `triage.config.yml` +
+network), and YAML-parse `.github/workflows/*.yml` + `wheelhouse.config.yml` +
 `.github/ISSUE_TEMPLATE/*.yml` (run `actionlint` if available; fetch the binary
 via its `download-actionlint.bash` if not). The live LLM paths (deep-review,
 nl_decisions) can only be exercised end-to-end in CI with the flag on and the

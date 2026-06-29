@@ -4,11 +4,15 @@ name: ingest
 # maintainer's decision, and we create/update a decision-card issue for it.
 #
 # Portability: the owner is github.repository_owner; the fleet + policy come from
-# triage.config.yml. Nothing here is account-specific.
+# wheelhouse.config.yml. Nothing here is account-specific.
 
 on:
   repository_dispatch:
-    types: [triage-item]
+    # `wheelhouse-item` is the current dispatch event type. `triage-item` is the
+    # legacy alias kept for back-compat: source repos onboarded before the rename
+    # still send it, so we keep listening for both rather than silently breaking
+    # their live dispatchers. New source-repo workflows should send wheelhouse-item.
+    types: [wheelhouse-item, triage-item]
   workflow_dispatch:
     inputs:
       repo:
@@ -45,7 +49,7 @@ permissions:
 
 # Serialize per target so a dispatch and a manual run can't double-create a card.
 concurrency:
-  group: triage-ingest-${{ github.event.client_payload.repo || github.event.inputs.repo }}-${{ github.event.client_payload.number || github.event.inputs.number }}
+  group: wheelhouse-ingest-${{ github.event.client_payload.repo || github.event.inputs.repo }}-${{ github.event.client_payload.number || github.event.inputs.number }}
   cancel-in-progress: false
 
 jobs:

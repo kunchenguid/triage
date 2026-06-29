@@ -5,6 +5,9 @@ Unit-exercise the decision parse/route logic with NO network and a MOCKED LLM.
 Run: python tests/test_decision.py   (stdlib only; exits non-zero on failure)
 
 Covers:
+  * the state-block marker rename is back-compatible: cards now WRITE
+    `wheelhouse-state`, but the legacy `triage-state` marker (carried by cards
+    rendered before the rename) MUST still parse so a live queue keeps working;
   * the checkbox path now consumes issue-ops/parser `{selected, unselected}`
     JSON (for the new + old card body) and keeps "exactly one newly-ticked";
   * the natural-language structured-intent contract: an `action` result drives
@@ -35,6 +38,27 @@ def check(name, cond):
 
 
 # --------------------------------------------------------------------------- #
+# state-block marker: new name written, legacy name still parsed (back-compat)
+# --------------------------------------------------------------------------- #
+def test_state_marker_back_compat():
+    parse = ad.core.parse_state_block
+    new = '<!-- wheelhouse-state: {"repo":"r","number":7,"kind":"pr-review"} -->'
+    legacy = '<!-- triage-state: {"repo":"r","number":7,"kind":"pr-review"} -->'
+    sn, sl = parse(new), parse(legacy)
+    check("state marker: new wheelhouse-state parses", sn is not None and sn["number"] == 7)
+    check("state marker: legacy triage-state still parses", sl is not None and sl["number"] == 7)
+    check("state marker: new and legacy parse identically", sn == sl)
+    # A real legacy card body (prose + checkboxes around the marker) still parses.
+    legacy_card = ("## Decision needed\n\n- [ ] Merge it <!-- opt:merge -->\n\n"
+                   '<!-- triage-state: {"repo":"lavish-axi","number":42,"kind":"pr-review",'
+                   '"head_sha":"abc","options":["merge","close","hold"]} -->')
+    s = parse(legacy_card)
+    check("state marker: legacy card body parses to full state",
+          s is not None and s["repo"] == "lavish-axi" and s["options"] == ["merge", "close", "hold"])
+    check("state marker: no marker -> None", parse("no marker here") is None)
+
+
+# --------------------------------------------------------------------------- #
 # checkbox path: issue-ops/parser JSON -> deterministic key diff
 # --------------------------------------------------------------------------- #
 def parser_json(*checked):
@@ -48,7 +72,7 @@ def parser_json(*checked):
     selected = [labels[k] for k in checked]
     unselected = [labels[k] for k in labels if k not in checked]
     # plus the noise lines the parser also sweeps into `unselected`
-    unselected += ["Tick **one** box ...", "<!-- triage-state: {\"options\":[]} -->"]
+    unselected += ["Tick **one** box ...", "<!-- wheelhouse-state: {\"options\":[]} -->"]
     return json.dumps({"decision": {"selected": selected, "unselected": unselected}})
 
 
@@ -228,7 +252,7 @@ def test_load_comments_tolerant():
 
 
 def test_prompt_includes_history_section():
-    body = '<!-- triage-state: {"repo":"r","number":1,"kind":"pr-review"} -->'
+    body = '<!-- wheelhouse-state: {"repo":"r","number":1,"kind":"pr-review"} -->'
     with_hist = ad.build_nl_prompt(body, "merge it", "(target)", "pr-review",
                                    history="Maintainer: earlier\n\nAssistant: reply")
     check("prompt: history section present when history given",
@@ -241,6 +265,7 @@ def test_prompt_includes_history_section():
 
 
 def main():
+    test_state_marker_back_compat()
     test_checkbox_diff()
     test_action_mode_drives_execute()
     test_answer_and_clarify_do_not_execute()

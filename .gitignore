@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 
-# Local triage scratch (scan/cards/item artifacts produced at runtime)
+# Local Wheelhouse scratch (scan/cards/item artifacts produced at runtime)
 scan.json
 cards.json
 item.json

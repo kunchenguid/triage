@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Triage Hub - decision executor.
+Wheelhouse - decision executor.
 
 Phases, run as separate workflow steps so each uses the right token:
 
@@ -19,7 +19,7 @@ Phases, run as separate workflow steps so each uses the right token:
 Natural-language phases (gated on nl_decisions + CLAUDE_CODE_OAUTH_TOKEN):
 
   nl-eligible  Print true/false: is this an owner comment that should be routed
-               to the LLM intent-mapper? (a triage card AND not a slash-command).
+               to the LLM intent-mapper? (a decision card AND not a slash-command).
 
   nl-prompt    Build the LLM prompt: the card + the owner's comment (trusted
                instructions) plus the target content as clearly-delimited
@@ -47,7 +47,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import triage_core as core  # noqa: E402
+import wheelhouse_core as core  # noqa: E402
 
 # Slash actions allowed per kind (checkbox options are a subset; comment/decline
 # are text-bearing and slash-only).
@@ -96,7 +96,7 @@ def set_output(name, value):
         return
     with open(path, "a") as f:
         if "\n" in text:
-            f.write("%s<<__TRIAGE_EOF__\n%s\n__TRIAGE_EOF__\n" % (name, text))
+            f.write("%s<<__WHEELHOUSE_EOF__\n%s\n__WHEELHOUSE_EOF__\n" % (name, text))
         else:
             f.write("%s=%s\n" % (name, text))
 
@@ -185,7 +185,7 @@ def cmd_parse():
     body = os.environ.get("ISSUE_BODY", "")
     state = core.parse_state_block(body)
     if not state:
-        set_output("decision", "")  # not a triage card
+        set_output("decision", "")  # not a decision card
         return
     kind = state.get("kind", "pr-review")
     allowed = ALLOWED.get(kind, set())
@@ -334,7 +334,7 @@ def is_slash_comment(comment):
 def cmd_nl_eligible():
     """Print true/false: should this owner comment be routed to the LLM?
 
-    Eligible iff the issue is a triage card AND the comment is free-form text
+    Eligible iff the issue is a decision card AND the comment is free-form text
     (not a slash-command). The owner-gate, the nl_decisions flag and the token
     presence are checked by the workflow; this only classifies the comment."""
     body = os.environ.get("ISSUE_BODY", "")
@@ -363,7 +363,7 @@ def build_nl_prompt(card_body, comment, target_content, kind, history=""):
         '"answer":"<required when mode=answer or clarify: the text to post>"}'
     )
     parts = [
-        "You are the intent-mapper for an open-source maintainer's triage hub.",
+        "You are the intent-mapper for Wheelhouse, an open-source maintainer's decision queue.",
         "A decision card tracks one pending decision about a target PR/issue. The",
         "maintainer just replied to the card in plain English. Map that reply to a",
         "STRUCTURED decision. You do NOT act on anything yourself - deterministic",

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Triage Hub - deterministic brain (ported from the local OSS-triage machinery).
+Wheelhouse - deterministic brain (ported from the local OSS-triage machinery).
 
 Runs inside GitHub Actions. One GraphQL query per repo fetches every open
 PR/issue with compliance + test status, classifies each deterministically, and
@@ -13,15 +13,15 @@ replaces has been dropped: the local single-flight lock (-> Actions
 state), per-repo `owner` (-> derived from github.repository_owner).
 
 Usage:
-  triage_core.py scan                 scan all configured repos -> JSON worklist on stdout
-  triage_core.py scan <repo>          scan a single configured repo
-  triage_core.py approve-ci <repo> <pr>   security-gated fork-CI approval (exit 4 = HOLD)
-  triage_core.py checks <repo>        list distinct check names on a repo's PRs (onboarding)
-  triage_core.py authorized           print true/false: is $SENDER allowed to drive decisions?
-  triage_core.py deep-review-enabled  print true/false: is deep_review on in config?
-  triage_core.py nl-decisions-enabled print true/false: is nl_decisions on in config?
-  triage_core.py state <field>        print one field of the state block in $ISSUE_BODY
-  triage_core.py repos                list configured repos
+  wheelhouse_core.py scan                 scan all configured repos -> JSON worklist on stdout
+  wheelhouse_core.py scan <repo>          scan a single configured repo
+  wheelhouse_core.py approve-ci <repo> <pr>   security-gated fork-CI approval (exit 4 = HOLD)
+  wheelhouse_core.py checks <repo>        list distinct check names on a repo's PRs (onboarding)
+  wheelhouse_core.py authorized           print true/false: is $SENDER allowed to drive decisions?
+  wheelhouse_core.py deep-review-enabled  print true/false: is deep_review on in config?
+  wheelhouse_core.py nl-decisions-enabled print true/false: is nl_decisions on in config?
+  wheelhouse_core.py state <field>        print one field of the state block in $ISSUE_BODY
+  wheelhouse_core.py repos                list configured repos
 
 Owner is derived from $GITHUB_REPOSITORY_OWNER (or --owner). Cross-repo reads
 use the ambient GH_TOKEN (set to FLEET_TOKEN by the calling workflow step).
@@ -42,10 +42,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Config search order: repo root, then .github/.
 CONFIG_CANDIDATES = [
-    os.path.join(ROOT, "triage.config.yml"),
-    os.path.join(ROOT, "triage.config.yaml"),
-    os.path.join(ROOT, ".github", "triage.config.yml"),
-    os.path.join(ROOT, ".github", "triage.config.yaml"),
+    os.path.join(ROOT, "wheelhouse.config.yml"),
+    os.path.join(ROOT, "wheelhouse.config.yaml"),
+    os.path.join(ROOT, ".github", "wheelhouse.config.yml"),
+    os.path.join(ROOT, ".github", "wheelhouse.config.yaml"),
 ]
 
 GQL = """
@@ -103,7 +103,7 @@ def config_path():
     for p in CONFIG_CANDIDATES:
         if os.path.exists(p):
             return p
-    sys.exit("no triage.config.yml found (looked in repo root and .github/)")
+    sys.exit("no wheelhouse.config.yml found (looked in repo root and .github/)")
 
 
 def load_config():
@@ -363,11 +363,20 @@ def build_repo(owner, repo_cfg, card_issues):
 # --------------------------------------------------------------------------- #
 # state block parsing (shared util)
 # --------------------------------------------------------------------------- #
-_STATE_RE = re.compile(r"<!--\s*triage-state:\s*(\{.*?\})\s*-->", re.S)
+# Cards now WRITE `wheelhouse-state` (see render_card.py), but the legacy
+# `triage-state` marker MUST keep parsing: existing open cards in a live machine
+# were rendered with it, and they have to stay drivable after the rename. So the
+# reader accepts BOTH; only the writer moved to the new name. (When a legacy card
+# is next upserted it is re-rendered with the new marker, so the queue migrates
+# itself over time.)
+_STATE_RE = re.compile(r"<!--\s*(?:wheelhouse|triage)-state:\s*(\{.*?\})\s*-->", re.S)
 
 
 def parse_state_block(body):
-    """Extract the hidden machine-readable state from a decision-card body."""
+    """Extract the hidden machine-readable state from a decision-card body.
+
+    Accepts the current `wheelhouse-state` marker and the legacy `triage-state`
+    marker (back-compat for cards rendered before the rename)."""
     if not body:
         return None
     m = _STATE_RE.search(body)

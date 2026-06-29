@@ -2,7 +2,7 @@ name: deep-review
 
 # PHASE 2 (optional, inert by default).
 #
-# When you enable it - set `deep_review: true` in triage.config.yml AND add the
+# When you enable it - set `deep_review: true` in wheelhouse.config.yml AND add the
 # CLAUDE_CODE_OAUTH_TOKEN secret (a Claude *subscription* token from
 # `claude setup-token`, NOT an Anthropic API key) - applying the
 # `needs-deep-review` label to a decision card runs Claude over the target
@@ -31,7 +31,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: triage-deepreview-${{ github.event.issue.number || github.event.inputs.issue }}
+  group: wheelhouse-deepreview-${{ github.event.issue.number || github.event.inputs.issue }}
   cancel-in-progress: false
 
 jobs:
@@ -58,7 +58,7 @@ jobs:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
         run: |
-          dr="$(python scripts/triage_core.py deep-review-enabled)"
+          dr="$(python scripts/wheelhouse_core.py deep-review-enabled)"
           enabled=false
           if [ "$dr" = "true" ] && [ "$HAS_TOKEN" = "true" ]; then enabled=true; fi
           echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
@@ -89,9 +89,9 @@ jobs:
           set -euo pipefail
           card_body="$(gh issue view "$ISSUE" --json body --jq .body)"
           export ISSUE_BODY="$card_body"
-          repo="$(python scripts/triage_core.py state repo)"
-          number="$(python scripts/triage_core.py state number)"
-          kind="$(python scripts/triage_core.py state kind)"
+          repo="$(python scripts/wheelhouse_core.py state repo)"
+          number="$(python scripts/wheelhouse_core.py state number)"
+          kind="$(python scripts/wheelhouse_core.py state kind)"
           slug="${GITHUB_REPOSITORY_OWNER}/${repo}"
 
           {
@@ -127,9 +127,9 @@ jobs:
 
           # Expose the prompt as a (multiline) step output.
           {
-            echo "prompt<<__TRIAGE_PROMPT_EOF__"
+            echo "prompt<<__WHEELHOUSE_PROMPT_EOF__"
             cat prompt.txt
-            echo "__TRIAGE_PROMPT_EOF__"
+            echo "__WHEELHOUSE_PROMPT_EOF__"
           } >> "$GITHUB_OUTPUT"
 
       # Run Claude via the subscription token. The action only gets this repo's

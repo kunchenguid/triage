@@ -21,7 +21,7 @@ permissions:
 
 # Serialize all handling of one card so concurrent ticks/comments can't race.
 concurrency:
-  group: triage-${{ github.event.issue.number }}
+  group: wheelhouse-${{ github.event.issue.number }}
   cancel-in-progress: false
 
 jobs:
@@ -46,7 +46,7 @@ jobs:
           SENDER: ${{ github.event.sender.login }}
           OWNER: ${{ github.repository_owner }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        run: echo "authorized=$(python scripts/triage_core.py authorized)" >> "$GITHUB_OUTPUT"
+        run: echo "authorized=$(python scripts/wheelhouse_core.py authorized)" >> "$GITHUB_OUTPUT"
 
       # --- Checkbox path -----------------------------------------------------
       # Render the card's checkboxes as {selected, unselected} via
@@ -61,13 +61,13 @@ jobs:
         uses: issue-ops/parser@cb7e2e4e5da701aad0e23e718bc4c91d442ca8ba # v5.0.0
         with:
           body: ${{ github.event.issue.body }}
-          issue-form-template: triage-decision.yml
+          issue-form-template: wheelhouse-decision.yml
       - id: checkboxes-old
         if: ${{ steps.gate.outputs.authorized == 'true' && github.event_name == 'issues' && github.event.action == 'edited' && github.event.changes.body.from != '' }}
         uses: issue-ops/parser@cb7e2e4e5da701aad0e23e718bc4c91d442ca8ba # v5.0.0
         with:
           body: ${{ github.event.changes.body.from }}
-          issue-form-template: triage-decision.yml
+          issue-form-template: wheelhouse-decision.yml
 
       # Parse the deterministic decision (checkbox tick / slash / label). No
       # token, no side effects.
@@ -96,7 +96,7 @@ jobs:
           ISSUE_BODY: ${{ github.event.issue.body }}
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          nl="$(python scripts/triage_core.py nl-decisions-enabled)"
+          nl="$(python scripts/wheelhouse_core.py nl-decisions-enabled)"
           eligible="$(python scripts/apply_decision.py nl-eligible)"
           proceed=false
           if [ "$nl" = "true" ] && [ "$HAS_TOKEN" = "true" ] && [ "$eligible" = "true" ]; then
@@ -106,9 +106,9 @@ jobs:
           # block (used by the fetch + execute steps below).
           {
             echo "proceed=$proceed"
-            echo "repo=$(python scripts/triage_core.py state repo)"
-            echo "number=$(python scripts/triage_core.py state number)"
-            echo "kind=$(python scripts/triage_core.py state kind)"
+            echo "repo=$(python scripts/wheelhouse_core.py state repo)"
+            echo "number=$(python scripts/wheelhouse_core.py state number)"
+            echo "kind=$(python scripts/wheelhouse_core.py state kind)"
           } >> "$GITHUB_OUTPUT"
           if [ "$proceed" != "true" ]; then
             echo "nl path inert (nl_decisions=$nl, token_present=$HAS_TOKEN, eligible=$eligible)"

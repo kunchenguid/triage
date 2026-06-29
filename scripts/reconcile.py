@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Triage Hub - backstop reconciler.
+Wheelhouse - backstop reconciler.
 
 The safety net behind the event-driven `ingest` path. Given a fresh scan of the
 fleet (scan.json) and the current open cards in THIS repo (cards.json), it:
@@ -24,7 +24,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import triage_core as core  # noqa: E402
+import wheelhouse_core as core  # noqa: E402
 import render_card  # noqa: E402
 
 PR_KINDS = {"pr-review", "ci-approval"}

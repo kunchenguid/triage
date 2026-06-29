@@ -3,14 +3,14 @@
 The scheduled `scan-backstop` already finds items in your fleet a few times a day with **no** changes to your other repos.
 This doc is the optional **fast path**: add a tiny dispatch workflow to a source repo so events show up in your queue in real time instead of waiting for the next scan.
 
-Nothing here is required to run the machine, and nothing here changes how the hub classifies items - a dispatch is just a low-latency nudge that creates (or updates) a card immediately; the backstop still reconciles everything later.
+Nothing here is required to run the machine, and nothing here changes how Wheelhouse classifies items - a dispatch is just a low-latency nudge that creates (or updates) a card immediately; the backstop still reconciles everything later.
 
-> You add these files to **your source repos**, not to the triage hub.
+> You add these files to **your source repos**, not to Wheelhouse.
 > The hub only ever reads; it never pushes to your source repos except to execute a decision you made.
 
 ## The dispatch contract
 
-A source repo notifies the hub by sending a `repository_dispatch` event with **event type `triage-item`** to the hub repo, with a `client_payload` describing the item:
+A source repo notifies the hub by sending a `repository_dispatch` event with **event type `wheelhouse-item`** to the hub repo, with a `client_payload` describing the item:
 
 | field            | required | meaning                                                            |
 | ---------------- | -------- | ------------------------------------------------------------------ |
@@ -27,21 +27,23 @@ A source repo notifies the hub by sending a `repository_dispatch` event with **e
 
 The hub's `ingest` workflow dedupes by target: a second dispatch for the same `repo`+`number` **updates** the existing card instead of creating a duplicate.
 
+> **Legacy event type.** Before the rename to Wheelhouse the event type was `triage-item`. `ingest.yml` still listens for both (`types: [wheelhouse-item, triage-item]`), so a source repo wired up before the rename keeps working - but new dispatchers should send `wheelhouse-item`.
+
 ## Token for the source side
 
 Sending a `repository_dispatch` to the hub requires a token with write access to the **hub** repo.
 
 - If your `FLEET_TOKEN` already includes the hub repo in its scope, you can reuse it.
-- Otherwise mint a fine-grained PAT scoped to **only the hub repo** with **Contents → Read and write**, and add it to the source repo as an Actions secret named `TRIAGE_DISPATCH_TOKEN`.
+- Otherwise mint a fine-grained PAT scoped to **only the hub repo** with **Contents → Read and write**, and add it to the source repo as an Actions secret named `WHEELHOUSE_DISPATCH_TOKEN`.
 
 ## Copy-paste: source-repo workflow
 
-Add this as `.github/workflows/notify-triage-hub.yml` **in the source repo**.
+Add this as `.github/workflows/notify-wheelhouse.yml` **in the source repo**.
 It fires when a non-draft PR is opened, marked ready, or labeled, and nudges the hub.
 Tune the trigger to match when *you* actually want to be asked (for example, only on a `ready-to-merge` label).
 
 ```yaml
-name: notify-triage-hub
+name: notify-wheelhouse
 
 on:
   pull_request:
@@ -55,14 +57,14 @@ jobs:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch to the triage hub
+      - name: Dispatch to Wheelhouse
         env:
           # A token that can write to the hub repo (reuse FLEET_TOKEN, or a
           # hub-scoped PAT). Stored as a secret in THIS source repo.
-          GH_TOKEN: ${{ secrets.TRIAGE_DISPATCH_TOKEN }}
-          # The hub repo. "triage" is the default name - change it if you
+          GH_TOKEN: ${{ secrets.WHEELHOUSE_DISPATCH_TOKEN }}
+          # The hub repo. "wheelhouse" is the default name - change it if you
           # renamed your fork. Owner is derived, so this stays account-agnostic.
-          HUB: ${{ github.repository_owner }}/triage
+          HUB: ${{ github.repository_owner }}/wheelhouse
           # Pass GitHub context via env (never inline into the shell) so a PR
           # title containing quotes/backticks can't break or inject the command.
           P_REPO: ${{ github.event.repository.name }}
@@ -77,7 +79,7 @@ jobs:
             --arg sha "$P_SHA" \
             --arg title "$P_TITLE" \
             --arg author "$P_AUTHOR" \
-            '{event_type:"triage-item", client_payload:{
+            '{event_type:"wheelhouse-item", client_payload:{
                 repo:$repo, number:($number|tonumber), kind:"pr-review",
                 head_sha:$sha, title:$title, author:$author }}')"
           echo "$payload" | gh api "repos/$HUB/dispatches" --input -

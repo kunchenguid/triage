@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Triage Hub - normalize an ingest payload into a decision-card item.
+Wheelhouse - normalize an ingest payload into a decision-card item.
 
 The `ingest` workflow feeds this either a repository_dispatch client_payload
 (JSON in $PAYLOAD) or workflow_dispatch inputs ($INPUT_*). It produces a single
