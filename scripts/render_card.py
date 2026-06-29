@@ -4,12 +4,12 @@ Wheelhouse - decision-card renderer + card operations.
 
 `render(item)` turns one classified item into a decision card: a human-readable
 body with quick-decision checkboxes and a hidden machine-readable state block.
-`upsert_card`/`close_card` create/update/consume cards in THIS repo (via the
+`upsert_card`/`close_card` create/refresh/consume cards in THIS repo (via the
 ambient GH_TOKEN, which the workflow sets to the default GITHUB_TOKEN so that
 card-side activity never re-triggers the handler).
 
 CLI:
-  render_card.py upsert --item-file item.json    create-or-update a card (dedup by marker)
+  render_card.py upsert --item-file item.json    create-or-refresh a card (dedup by marker)
   render_card.py render --item-file item.json --out-dir DIR    debug: write title/body/labels
 """
 import argparse

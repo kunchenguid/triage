@@ -7,12 +7,12 @@ fleet (scan.json) and the current open cards in THIS repo (cards.json), it:
 
   * opens a decision card for any worklist item that has no open card,
   * refreshes an OPEN `needs-decision` card in place when its target's material
-    state changed (head_sha/compliance/tests/kind/priority) - so the queue
+    state changed (head_sha/compliance/tests/kind/priority/options) - so the queue
     reflects current state, not just the snapshot taken when the card was first
     created - and leaves materially-unchanged cards completely untouched, and
-  * closes any open card whose underlying PR/issue is no longer open, or whose
-    open target no longer needs a maintainer decision - so the queue self-heals
-    even if a dispatch was lost.
+  * closes any open card whose underlying PR/issue is no longer open, and closes
+    pure pending cards whose open target no longer needs a maintainer decision -
+    so the queue self-heals even if a dispatch was lost.
 
 Both card operations run against THIS repo via the ambient GH_TOKEN, which the
 workflow sets to the default GITHUB_TOKEN (card activity must not re-trigger the
