@@ -93,7 +93,7 @@ jobs:
 ### Notes
 
 - **Injection-safe by construction.** GitHub context values are passed through `env:` and read by `jq --arg`, never interpolated into the shell - a hostile PR title cannot break out.
-- **`ci-approval` items.** If you want fork-CI approvals to surface fast, add a job that dispatches with `kind:"ci-approval"` when a run reaches `action_required` (e.g. on `workflow_run`). The hub still applies the security HOLD before approving anything that touches CI files.
+- **`ci-approval` items.** If you want every fork-CI approval to surface fast, add a job that dispatches with `kind:"ci-approval"` when a run reaches `action_required` (e.g. on `workflow_run`). Ingest dispatches create or refresh a card immediately; they do not run the scan-time `auto_approve_ci` path. If you want provably-safe runs auto-cleared instead of carded, rely on `scan-backstop` for CI approvals. When you do approve a card, the hub still applies the same gate: CI/action-file changes are held, and non-default bases or `pull_request_target` posture are surfaced as warnings.
 - **Issues.** To push issue triage, dispatch with `kind:"issue-triage"` from an `issues` trigger. (The hub also cards issues from the backstop when `card_issues: true`.)
 - **Third-party alternative.** If you prefer, `peter-evans/repository-dispatch` does the same dispatch as an action; the `gh api` form above keeps you dependency-free.
 

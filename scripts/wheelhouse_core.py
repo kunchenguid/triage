@@ -5,7 +5,9 @@ Wheelhouse - deterministic brain (ported from the local OSS-triage machinery).
 Runs inside GitHub Actions. One GraphQL query per repo fetches every open
 PR/issue with compliance + test status, classifies each deterministically, and
 emits a worklist of items that need the maintainer's decision. Also carries the
-security-gated CI approval (the fork-CI / pwn-request HOLD).
+security-gated CI approval (the fork-CI / pwn-request HOLD) and the scan-time
+auto-approval of provably-safe fork-CI runs (so only risky or uncertain ones
+raise a card).
 
 This is the GHA port of `data/triage/triage.py`. What the Actions model
 replaces has been dropped: the local single-flight lock (-> Actions
@@ -13,8 +15,8 @@ replaces has been dropped: the local single-flight lock (-> Actions
 state), per-repo `owner` (-> derived from github.repository_owner).
 
 Usage:
-  wheelhouse_core.py scan                 scan all configured repos -> JSON worklist on stdout
-  wheelhouse_core.py scan <repo>          scan a single configured repo
+  wheelhouse_core.py scan                 scan all configured repos -> JSON worklist; may auto-approve safe fork CI
+  wheelhouse_core.py scan <repo>          scan a single configured repo; may auto-approve safe fork CI
   wheelhouse_core.py approve-ci <repo> <pr>   security-gated fork-CI approval (exit 4 = HOLD)
   wheelhouse_core.py checks <repo>        list distinct check names on a repo's PRs (onboarding)
   wheelhouse_core.py authorized           print true/false: is $SENDER allowed to drive decisions?
@@ -24,8 +26,10 @@ Usage:
   wheelhouse_core.py repos                list configured repos
 
 Owner is derived from $GITHUB_REPOSITORY_OWNER (or --owner). Cross-repo reads
-use the ambient GH_TOKEN (set to FLEET_TOKEN by the calling workflow step).
+and fork-CI approvals use the ambient GH_TOKEN (set to FLEET_TOKEN by the
+calling workflow step).
 """
+import base64
 import json
 import os
 import re
@@ -51,12 +55,13 @@ CONFIG_CANDIDATES = [
 GQL = """
 query($owner:String!, $name:String!) {
   repository(owner:$owner, name:$name) {
+    defaultBranchRef { name }
     pullRequests(states:OPEN, first:100, orderBy:{field:UPDATED_AT, direction:DESC}) {
       totalCount
       nodes {
-        number title isDraft updatedAt
+        number title isDraft updatedAt changedFiles
         author { login }
-        headRefName headRefOid
+        headRefName headRefOid baseRefName
         labels(first:20){ nodes{ name } }
         closingIssuesReferences(first:10){ nodes{ number } }
         commits(last:1){ nodes{ commit{ statusCheckRollup{
@@ -120,6 +125,10 @@ def load_config():
         "deep_review": bool(cfg.get("deep_review", False)),
         "nl_decisions": bool(cfg.get("nl_decisions", False)),
         "card_issues": bool(cfg.get("card_issues", False)),
+        # Security-relevant DEFAULT ON (opt-out): when the key is absent a fresh
+        # fork still gets scan-time auto-approval of provably-safe fork-CI runs.
+        # Set false to restore the click-to-approve-everything behavior.
+        "auto_approve_ci": bool(cfg.get("auto_approve_ci", True)),
     }
 
 
@@ -282,8 +291,94 @@ def _recommendation(bucket):
     }.get(bucket, "Needs your call.")
 
 
-def build_repo(owner, repo_cfg, card_issues):
-    """Scan one repo. Returns (repo_result, items)."""
+def _auto_approve_enabled(repo_cfg, global_default):
+    """Effective auto_approve_ci for one repo: the per-repo `auto_approve_ci`
+    override if set, else the global flag (which itself defaults to True). A
+    cheap, portable escape hatch - a single repo can opt out without flipping the
+    fleet-wide default."""
+    v = repo_cfg.get("auto_approve_ci")
+    return global_default if v is None else bool(v)
+
+
+def _display_list(values, limit=10):
+    items = [str(v) for v in (values or [])]
+    if len(items) <= limit:
+        return ", ".join(items)
+    return "%s (+%d more; %d total)" % (", ".join(items[:limit]), len(items) - limit, len(items))
+
+
+def _non_default_base_posture(base_ref, default_branch):
+    base = str(base_ref or "").strip()
+    default = str(default_branch or "").strip()
+    if base and default and base == default:
+        return None
+    return {"pr_target": True, "exploit": False, "error": True,
+            "non_default_base": True, "base_ref": base, "default_branch": default}
+
+
+def _ci_safety_note(verdict):
+    """A human warning for a ci-approval CARD (the not-auto-approved path), so
+    the maintainer decides with eyes open. Loudest signal first."""
+    parts = []
+    if verdict.get("non_default_base"):
+        base = verdict.get("base_ref") or "<unknown>"
+        default = verdict.get("default_branch") or "<unknown>"
+        parts.append("This PR targets base branch `%s`, but the repo default is `%s`. "
+                     "Wheelhouse only auto-checks `pull_request_target` posture on the "
+                     "default branch, so it fails closed and raises a card for manual review."
+                     % (base, default))
+    elif verdict.get("exploit"):
+        parts.append("DANGER (pwn-request): a `pull_request_target` workflow on the base branch "
+                     "checks out this PR's head, so running fork CI could execute attacker-controlled "
+                     "code with repo secrets. Review the diff with extreme care before approving.")
+    elif verdict.get("pr_target"):
+        parts.append("This repo runs a `pull_request_target` workflow (it executes with repo secrets "
+                     "and fires automatically, independent of this approval). Approving here only "
+                     "clears the read-only fork `pull_request` run - review the PR contents before "
+                     "trusting CI output.")
+    if verdict.get("risky_files"):
+        parts.append("This PR changes CI-execution files (%s); approving would run the PR's OWN "
+                     "workflow/action code, so it is held for manual review."
+                     % _display_list(verdict["risky_files"]))
+    return " ".join(parts)
+
+
+def _auto_approve_or_card(owner, name, pr_number, posture, auto_enabled, changed_files=None):
+    """For one `needs-ci-approval` PR, decide auto-approve vs card.
+
+    Returns (handled, note) where:
+      * handled=True  -> the run was auto-approved; emit NO card. `note` is the
+        audit line.
+      * handled=False -> raise a card; `note` is the safety warning to surface on
+        it (may be "").
+    Fails CLOSED: any uncertainty (unsafe verdict, hold, approve error/exception)
+    routes to a card so nothing is ever silently lost."""
+    verdict = ci_safety("%s/%s" % (owner, name), str(pr_number), posture, changed_files)
+    if auto_enabled and verdict["safe"]:
+        try:
+            status, message = approve_ci(owner, name, str(pr_number), posture=posture, strict=True)
+        except Exception as e:  # an approve that throws must fall back to a card
+            status, message = ("error", "auto-approve raised: %s" % str(e)[:160])
+        if status == "approved":
+            return (True, "auto-approved (%s): %s" % (verdict["reason"], message))
+        # hold / error -> fall through to a card (fail-closed), keeping the why.
+        note = "auto-approve did not complete (%s: %s)" % (status, message)
+        card_note = _ci_safety_note(verdict)
+        if card_note:
+            note += "; " + card_note
+        return (False, note)
+    return (False, _ci_safety_note(verdict))
+
+
+def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
+    """Scan one repo. Returns (repo_result, items).
+
+    `auto_approve_ci` is the fleet-wide default (config `auto_approve_ci`, itself
+    defaulting True); a repo may override it per-repo. When enabled, a fork PR
+    whose `ci_safety` verdict is provably safe is approved here (in the
+    FLEET_TOKEN scan context) and emits NO card; everything risky/uncertain still
+    becomes a card. This runs only on the ok:true success path below, so an
+    ok:false repo (early return) is never auto-approved."""
     name = repo_cfg["name"]
     slug = "%s/%s" % (owner, name)
     try:
@@ -294,6 +389,7 @@ def build_repo(owner, repo_cfg, card_issues):
 
     prs = data["pullRequests"]["nodes"]
     issues = data["issues"]["nodes"]
+    default_branch = ((data.get("defaultBranchRef") or {}).get("name") or "").strip()
     all_names = set()
     enriched = []
     closing = {}  # issue -> [pr numbers]
@@ -309,10 +405,15 @@ def build_repo(owner, repo_cfg, card_issues):
             "author": (pr.get("author") or {}).get("login", "?"),
             "comp": comp, "tests": tests, "ci": ci, "bucket": bucket,
             "closes": closes, "head_sha": pr["headRefOid"],
+            "changed_files": pr.get("changedFiles"),
+            "base_ref": pr.get("baseRefName"),
         })
 
     open_issue_numbers = [it["number"] for it in issues]
     addressed = {n for n in closing if n in set(open_issue_numbers)}
+
+    auto_enabled = _auto_approve_enabled(repo_cfg, auto_approve_ci)
+    default_posture = None
 
     items = []
     for pr in enriched:
@@ -324,14 +425,30 @@ def build_repo(owner, repo_cfg, card_issues):
         summary = "compliance=%s tests=%s" % (pr["comp"], pr["tests"])
         if overlap:
             summary += "; " + overlap
-        items.append({
+        item = {
             "repo": name, "number": pr["number"], "kind": kind,
             "head_sha": pr["head_sha"], "title": pr["title"], "author": pr["author"],
             "bucket": pr["bucket"], "comp": pr["comp"], "tests": pr["tests"],
             "url": "https://github.com/%s/pull/%d" % (slug, pr["number"]),
             "summary": summary, "recommendation": _recommendation(pr["bucket"]),
             "priority": priority,
-        })
+        }
+
+        if kind == "ci-approval":
+            posture = _non_default_base_posture(pr.get("base_ref"), default_branch)
+            if posture is None:
+                if default_posture is None:
+                    default_posture = repo_pr_target_posture(slug)
+                posture = default_posture
+            handled, note = _auto_approve_or_card(owner, name, pr["number"], posture,
+                                                  auto_enabled, pr.get("changed_files"))
+            if handled:
+                print("::notice::%s#%s %s" % (name, pr["number"], note), file=sys.stderr)
+                continue  # provably safe (or nothing to approve) -> NO card
+            if note:  # surface the safety warning on the card body / response
+                item["warning"] = note
+
+        items.append(item)
 
     if card_issues:
         for it in issues:
@@ -389,20 +506,48 @@ def parse_state_block(body):
 
 
 # --------------------------------------------------------------------------- #
-# security-gated CI approval (ported exit-4 HOLD)
+# security-gated CI approval (ported exit-4 HOLD) + shared safety verdict
 # --------------------------------------------------------------------------- #
-def _ci_risky_files(slug, pr):
-    """Files whose change makes approving fork CI dangerous: approving runs the
-    PR's OWN workflow/action code (the 'pwn request' supply-chain vector).
-    Fails CLOSED - if files can't be listed, treat as risky."""
+# `ci_safety` is the ONE security definition. Both the scan-time auto-approve
+# path (`build_repo`) and the manual gate (`approve_ci`) consult it, so the auto
+# path can never approve something the manual gate would HOLD - it is a strict
+# subset. Every read fails CLOSED (unknown -> treated as unsafe).
+def _is_not_found(stderr):
+    s = (stderr or "").lower()
+    return "404" in s or "not found" in s
+
+
+def _gh_api_capture(path):
+    """Raw `gh api <path>` returning the CompletedProcess so the caller can tell
+    a 404 (genuinely absent) apart from a read error (must fail closed)."""
+    return subprocess.run(["gh", "api", path], capture_output=True, text=True)
+
+
+def _changed_file_count(value):
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return count if count >= 0 else None
+
+
+def _list_pr_files(slug, pr, expected_count=None):
+    """Return (files, ok, complete). ok/complete=False means the caller fails closed."""
     out = subprocess.run(
         ["gh", "api", "--paginate", "/repos/%s/pulls/%s/files" % (slug, pr), "--jq", ".[].filename"],
         capture_output=True, text=True)
     if out.returncode != 0:
-        return ["<could-not-list-files - failing closed>"]
+        return ([], False, False)
+    files = [f.strip() for f in out.stdout.splitlines() if f.strip()]
+    count = _changed_file_count(expected_count)
+    return (files, True, count is not None and len(files) >= count)
+
+
+def _risky_ci_files(files):
+    """Of `files`, the ones whose change makes approving fork CI dangerous:
+    approving runs the PR's OWN workflow/action code (the 'pwn request' vector)."""
     risky = []
-    for f in out.stdout.splitlines():
-        f = f.strip()
+    for f in files:
         if (f.startswith(".github/workflows/") or f.startswith(".github/actions/")
                 or f.endswith("/action.yml") or f.endswith("/action.yaml")
                 or f in ("action.yml", "action.yaml")):
@@ -410,44 +555,357 @@ def _ci_risky_files(slug, pr):
     return risky
 
 
-def approve_ci(owner, repo, pr):
+def _on_triggers(doc):
+    """The set of trigger names declared by a parsed workflow doc. Tolerates the
+    YAML 1.1 gotcha where the bare key `on:` parses as the boolean True."""
+    on = None
+    if isinstance(doc, dict):
+        if "on" in doc:
+            on = doc["on"]
+        elif True in doc:  # `on:` parsed as boolean True by PyYAML
+            on = doc[True]
+    triggers = set()
+    if isinstance(on, str):
+        triggers.add(on)
+    elif isinstance(on, list):
+        triggers.update(str(x) for x in on)
+    elif isinstance(on, dict):
+        triggers.update(str(k) for k in on.keys())
+    return triggers
+
+
+# The supply-chain exploit signature: a workflow that pins a checkout `ref` to
+# the PR head. Combined with `pull_request_target` (runs with repo secrets), this
+# executes attacker-controlled code with the repo's credentials.
+_PR_HEAD_REF_RE = re.compile(r"github\.event\.pull_request\.head\.(?:sha|ref)|github\.head_ref")
+
+
+def _checks_out_pr_head(doc):
+    """True if any job step is an actions/checkout pinning `ref` to the PR head.
+    Best-effort but reliable (parses jobs/steps, not free text)."""
+    if not isinstance(doc, dict):
+        return False
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, dict):
+        return False
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            if "actions/checkout" not in str(step.get("uses") or ""):
+                continue
+            with_ = step.get("with")
+            if isinstance(with_, dict) and _PR_HEAD_REF_RE.search(str(with_.get("ref") or "")):
+                return True
+    return False
+
+
+def _list_workflow_files(slug):
+    """Return (paths, status). status in 'ok' (paths listed) / 'none' (no
+    .github/workflows dir - genuinely no workflows) / 'error' (read failed - the
+    caller must fail closed)."""
+    r = _gh_api_capture("/repos/%s/contents/.github/workflows" % slug)
+    if r.returncode != 0:
+        return ([], "none" if _is_not_found(r.stderr) else "error")
+    try:
+        entries = json.loads(r.stdout)
+    except ValueError:
+        return ([], "error")
+    if not isinstance(entries, list):  # a file where a dir was expected
+        return ([], "none")
+    if len(entries) >= 1000:
+        return ([], "error")
+    paths = []
+    for e in entries:
+        if isinstance(e, dict) and e.get("type") == "file":
+            name = str(e.get("name") or "")
+            if name.endswith(".yml") or name.endswith(".yaml"):
+                paths.append(e.get("path") or (".github/workflows/" + name))
+    return (paths, "ok")
+
+
+def _fetch_workflow_text(slug, path):
+    """Decoded text of one workflow file, or None on any read/decode failure."""
+    r = _gh_api_capture("/repos/%s/contents/%s" % (slug, path))
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("encoding") != "base64":
+        return None
+    content = data.get("content")
+    if content is None:
+        return None
+    try:
+        return base64.b64decode(content).decode("utf-8", "replace")
+    except (ValueError, TypeError):
+        return None
+
+
+def repo_pr_target_posture(slug):
+    """The source repo's default-branch `pull_request_target` posture, computed
+    ONCE per repo (read `.github/workflows/*.yml|*.yaml` via the API; reuse for
+    PRs whose base is the repo default branch).
+
+    Returns {pr_target, exploit, error}:
+      * pr_target - a default-branch workflow triggers on `pull_request_target`
+        (which runs in the repo context WITH secrets).
+      * exploit   - one of those workflows also checks out the PR head (the
+        pwn-request supply-chain pattern) - flagged loudly, best-effort.
+      * error     - a read/parse failure tripped the fail-closed path.
+    Fails CLOSED: any unread/unparseable workflow makes pr_target True."""
+    paths, status = _list_workflow_files(slug)
+    if status == "error":
+        return {"pr_target": True, "exploit": False, "error": True}
+    if status == "none" or not paths:
+        return {"pr_target": False, "exploit": False, "error": False}
+    pr_target = False
+    exploit = False
+    for path in paths:
+        text = _fetch_workflow_text(slug, path)
+        if text is None:
+            return {"pr_target": True, "exploit": False, "error": True}
+        try:
+            doc = yaml.safe_load(text)
+        except yaml.YAMLError:
+            return {"pr_target": True, "exploit": False, "error": True}
+        if "pull_request_target" in _on_triggers(doc):
+            pr_target = True
+            if _checks_out_pr_head(doc):
+                exploit = True
+    return {"pr_target": pr_target, "exploit": exploit, "error": False}
+
+
+def ci_safety(slug, pr, repo_posture, changed_files=None):
+    """The shared safety verdict for approving a fork PR's awaiting CI run.
+
+    Combines per-PR risky files with the per-repo `pull_request_target` posture
+    (`repo_posture`, from `repo_pr_target_posture`, passed in so it is computed
+    once per repo, not re-fetched per PR). Returns a dict:
+      {safe, error, risky_files, pr_target, exploit, reason}
+    `safe` is True only when there are NO risky files, NO pull_request_target
+    posture, and NO fail-closed read error - i.e. provably safe to auto-clear."""
+    repo_posture = repo_posture or {}
+    pr_target = bool(repo_posture.get("pr_target"))
+    exploit = bool(repo_posture.get("exploit"))
+    posture_error = bool(repo_posture.get("error"))
+    non_default_base = bool(repo_posture.get("non_default_base"))
+    base_ref = repo_posture.get("base_ref") or ""
+    default_branch = repo_posture.get("default_branch") or ""
+
+    files, ok, complete = _list_pr_files(slug, pr, changed_files)
+    if not ok:
+        risky = ["<could-not-list-files - failing closed>"]
+        file_error = True
+    elif not complete:
+        risky = _risky_ci_files(files) + ["<could-not-list-all-files - failing closed>"]
+        file_error = True
+    else:
+        risky = _risky_ci_files(files)
+        file_error = False
+
+    error = file_error or posture_error
+    safe = not risky and not pr_target and not error
+
+    if safe:
+        reason = "no risky files and no pull_request_target posture"
+    else:
+        bits = []
+        if risky:
+            bits.append("touches CI-execution files (%s)" % _display_list(risky))
+        if non_default_base:
+            bits.append("targets base branch `%s`, not repo default `%s` (failing closed)"
+                        % (base_ref or "<unknown>", default_branch or "<unknown>"))
+        elif pr_target:
+            bits.append("base branch runs a pull_request_target workflow"
+                        + (" (workflows unreadable - failing closed)" if posture_error else ""))
+        if exploit:
+            bits.append("a pull_request_target workflow checks out the PR head (pwn-request)")
+        reason = "; ".join(bits) or "fail-closed"
+
+    return {"safe": safe, "error": error, "risky_files": risky,
+            "pr_target": pr_target, "exploit": exploit, "reason": reason,
+            "non_default_base": non_default_base, "base_ref": base_ref,
+            "default_branch": default_branch}
+
+
+def _approve_warning_suffix(verdict):
+    """The pull_request_target / exploit warning appended to an approve response
+    so the maintainer acts with eyes open (the manual path does NOT block on
+    posture - the pull_request_target run fires automatically regardless)."""
+    if verdict.get("non_default_base"):
+        base = verdict.get("base_ref") or "<unknown>"
+        default = verdict.get("default_branch") or "<unknown>"
+        return ("  NOTE: this PR targets base branch `%s`, but the repo default is `%s`; "
+                "Wheelhouse fails closed for non-default bases and this approval only clears "
+                "the read-only fork pull_request run." % (base, default))
+    if verdict.get("exploit"):
+        return ("  DANGER: a pull_request_target workflow on the base branch checks out this PR's "
+                "head (pwn-request pattern); it runs with repo secrets regardless of this approval - "
+                "review the diff before trusting CI.")
+    if verdict.get("pr_target"):
+        return ("  NOTE: this repo runs a pull_request_target workflow that executes with repo "
+                "secrets and fires automatically regardless of this approval; this approval only "
+                "clears the read-only fork pull_request run.")
+    return ""
+
+
+def _workflow_run_matches_pr(slug, run_id, pr, head_sha):
+    r = _gh_api_capture("/repos/%s/actions/runs/%s" % (slug, run_id))
+    if r.returncode != 0:
+        return (None, "run detail fetch failed: %s" % r.stderr.strip()[:160])
+    try:
+        run = json.loads(r.stdout)
+    except ValueError:
+        return (None, "run detail returned invalid JSON")
+    run_head = str(run.get("head_sha") or "")
+    if run_head != str(head_sha):
+        return (False, "head %s" % (run_head[:12] or "<missing>"))
+    prs = run.get("pull_requests")
+    if not isinstance(prs, list):
+        return (None, "run detail returned unexpected pull_requests")
+    numbers = []
+    for item in prs:
+        if not isinstance(item, dict) or item.get("number") is None:
+            return (None, "run detail returned unexpected pull_requests")
+        numbers.append(str(item.get("number")))
+    if len(numbers) != 1:
+        return (None, "run detail has %d pull request associations" % len(numbers))
+    if numbers[0] != str(pr):
+        return (False, "not PR #%s" % pr)
+    return (True, "")
+
+
+def approve_ci(owner, repo, pr, posture=None, strict=False):
     """Approve fork-PR workflow runs awaiting maintainer approval.
+
+    `posture` (from `repo_pr_target_posture`) is passed by the scan-time auto path
+    to avoid re-reading the repo's workflows; the manual path leaves it None and
+    it is computed here. The security verdict is `ci_safety` - the SAME definition
+    the auto path uses. With `strict=True`, approval-time safety is re-read and
+    any non-safe verdict blocks approval.
 
     Returns (status, message). status in:
       approved - one or more runs approved
       noop     - nothing awaiting approval
-      hold     - SECURITY HOLD (PR changes CI-execution files) - NOT approved
+      hold     - SECURITY HOLD (PR changes CI-execution files / files unreadable) - NOT approved
       error    - could not act
     """
     slug = "%s/%s" % (owner, repo)
     pj = subprocess.run(["gh", "api", "/repos/%s/pulls/%s" % (slug, pr)], capture_output=True, text=True)
     if pj.returncode != 0:
         return ("error", "pr fetch failed: %s" % pj.stderr.strip()[:160])
-    head_ref = json.loads(pj.stdout)["head"]["ref"]
+    try:
+        pr_data = json.loads(pj.stdout)
+    except ValueError:
+        return ("error", "pr fetch returned invalid JSON")
+    head = pr_data.get("head") or {}
+    base = pr_data.get("base") or {}
+    head_ref = str(head.get("ref") or "")
+    head_sha = str(head.get("sha") or "")
+    if not head_ref or not head_sha:
+        return ("error", "pr fetch returned missing head ref/sha")
+    changed_files = pr_data.get("changed_files")
+    base_ref = str(base.get("ref") or "")
+    default_branch = str(((base.get("repo") or {}).get("default_branch")) or "")
 
-    risky = _ci_risky_files(slug, pr)
-    if risky:
+    base_posture = _non_default_base_posture(base_ref, default_branch)
+    if base_posture is not None:
+        posture = base_posture
+    elif strict or posture is None:
+        posture = repo_pr_target_posture(slug)
+    verdict = ci_safety(slug, pr, posture, changed_files)
+
+    # Risky CI-execution files (or an unreadable file list) -> HARD HOLD,
+    # unchanged. A pull_request_target posture does NOT hard-block the manual
+    # path; it only adds a warning (see _approve_warning_suffix).
+    if verdict["risky_files"]:
         return ("hold",
                 "SECURITY HOLD: #%s changes CI-execution files - NOT auto-approving. Approving fork "
                 "CI would run the PR's OWN workflow/action code with repo perms. Needs manual review: %s"
-                % (pr, ", ".join(risky)))
+                % (pr, _display_list(verdict["risky_files"])))
 
+    warn = _approve_warning_suffix(verdict)
+    if strict and not verdict["safe"]:
+        return ("error", "#%s (%s@%s): strict auto-approval blocked by approval-time "
+                "safety verdict: %s%s"
+                % (pr, head_ref, head_sha[:8], verdict.get("reason") or "not safe", warn))
+
+    run_list_limit = 30
     lst = subprocess.run(
-        ["gh", "run", "list", "--branch", head_ref, "--status", "action_required",
-         "--limit", "30", "-R", slug, "--json", "databaseId,workflowName"],
+        ["gh", "run", "list", "--branch", head_ref, "--commit", head_sha,
+         "--status", "action_required", "--limit", str(run_list_limit), "-R", slug,
+         "--json", "databaseId,workflowName,headSha,headBranch,url"],
         capture_output=True, text=True)
-    runs = json.loads(lst.stdout) if lst.returncode == 0 and lst.stdout.strip() else []
+    if lst.returncode != 0:
+        return ("error", "#%s (%s@%s): workflow run list failed: %s%s"
+                % (pr, head_ref, head_sha[:8], lst.stderr.strip()[:160], warn))
+    if not lst.stdout.strip():
+        return ("error", "#%s (%s@%s): workflow run list returned no output%s"
+                % (pr, head_ref, head_sha[:8], warn))
+    try:
+        runs = json.loads(lst.stdout)
+    except ValueError:
+        return ("error", "#%s (%s@%s): workflow run list returned invalid JSON%s"
+                % (pr, head_ref, head_sha[:8], warn))
+    if not isinstance(runs, list):
+        return ("error", "#%s (%s@%s): workflow run list returned unexpected data%s"
+                % (pr, head_ref, head_sha[:8], warn))
+    if len(runs) >= run_list_limit:
+        return ("error", "#%s (%s@%s): workflow run list returned %d runs (limit %d); "
+                "refusing to approve a possibly truncated list%s"
+                % (pr, head_ref, head_sha[:8], len(runs), run_list_limit, warn))
     if not runs:
-        return ("noop", "#%s (%s): no workflow runs awaiting approval" % (pr, head_ref))
+        return ("noop", "#%s (%s@%s): no workflow runs awaiting approval%s"
+                % (pr, head_ref, head_sha[:8], warn))
+
+    matching = []
+    skipped = []
+    for run in runs:
+        if not isinstance(run, dict) or not run.get("databaseId"):
+            return ("error", "#%s (%s@%s): workflow run list returned an entry without databaseId%s"
+                    % (pr, head_ref, head_sha[:8], warn))
+        name = run.get("workflowName", "?")
+        match, reason = _workflow_run_matches_pr(slug, run["databaseId"], pr, head_sha)
+        if match is None:
+            return ("error", "#%s (%s@%s): workflow run %s could not be verified: %s%s"
+                    % (pr, head_ref, head_sha[:8], name, reason, warn))
+        if match:
+            matching.append(run)
+        else:
+            skipped.append("%s:%s" % (name, reason))
+    if not matching:
+        msg = "#%s (%s@%s): no matching workflow runs awaiting approval" % (pr, head_ref, head_sha[:8])
+        if skipped:
+            msg += " (skipped %d unrelated run(s): %s)" % (len(skipped), ", ".join(skipped)[:240])
+        return ("noop", msg + warn)
 
     done = []
-    for run in runs:
+    failed = []
+    for run in matching:
         rid = run["databaseId"]
         ar = subprocess.run(
             ["gh", "api", "--method", "POST", "/repos/%s/actions/runs/%s/approve" % (slug, rid)],
             capture_output=True, text=True)
-        done.append("%s:%s" % (run.get("workflowName", "?"), "OK" if ar.returncode == 0 else "FAIL"))
-    return ("approved", "#%s (%s): approved %d run(s) [%s]" % (pr, head_ref, len(runs), ", ".join(done)))
+        name = run.get("workflowName", "?")
+        if ar.returncode == 0:
+            done.append("%s:OK" % name)
+        else:
+            done.append("%s:FAIL" % name)
+            failed.append("%s:%s" % (name, ar.stderr.strip()[:160] or "approval failed"))
+    if failed:
+        return ("error", "#%s (%s@%s): approved %d/%d matching run(s), failed [%s] [%s]%s"
+                % (pr, head_ref, head_sha[:8], len(matching) - len(failed), len(matching),
+                   ", ".join(failed), ", ".join(done), warn))
+    return ("approved", "#%s (%s@%s): approved %d matching run(s) [%s]%s"
+            % (pr, head_ref, head_sha[:8], len(matching), ", ".join(done), warn))
 
 
 # --------------------------------------------------------------------------- #
@@ -467,7 +925,8 @@ def cmd_scan(only_repo=None):
     out_repos = {}
     items = []
     for name in names:
-        result, repo_items = build_repo(owner, repos[name], cfg["card_issues"])
+        result, repo_items = build_repo(owner, repos[name], cfg["card_issues"],
+                                        cfg["auto_approve_ci"])
         out_repos[name] = result
         items.extend(repo_items)
         if result.get("warning"):
@@ -477,6 +936,7 @@ def cmd_scan(only_repo=None):
         "owner": owner,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "card_issues": cfg["card_issues"],
+        "auto_approve_ci": cfg["auto_approve_ci"],
         "repos": out_repos,
         "items": items,
     }

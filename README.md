@@ -52,15 +52,22 @@ repos:
   - name: my-service                      # repo name only (resolved under your owner)
     compliance_check: "required-policy-check"  # exact name of a required gate check, or null
     test_check_patterns: ["test", "build", "e2e"]  # substrings that identify your test/CI checks
+    # auto_approve_ci: false              # optional per-repo override
   - name: my-cli
     compliance_check: null
     test_check_patterns: ["ci", "test"]
 
-maintainer: ""        # optional extra login allowed to drive decisions; default = repo owner
-deep_review: false    # LLM side-job: label -> read-only review verdict (off by default)
-nl_decisions: false   # LLM side-job: reply to a card in plain English (off by default)
-card_issues: false    # also card un-addressed issues, not just PRs (default: PRs only)
+maintainer: ""         # optional extra login allowed to drive decisions; default = repo owner
+deep_review: false     # LLM side-job: label -> read-only review verdict (off by default)
+nl_decisions: false    # LLM side-job: reply to a card in plain English (off by default)
+card_issues: false     # also card un-addressed issues, not just PRs (default: PRs only)
+auto_approve_ci: true  # auto-approve provably-safe fork-CI runs (DEFAULT ON; see Security notes)
 ```
+
+> **Heads-up - `auto_approve_ci` defaults ON.**
+> When this key is absent it is treated as `true`, so a fresh fork auto-approves fork-CI runs that the security gate proves safe (no CI-file changes, the PR targets the repo default branch, no `pull_request_target` workflow, and all safety reads and approvals succeed) and only raises a card for risky or uncertain runs.
+> Set it to `false` to opt out (every awaiting run raises a card, as you click to approve each), or add `auto_approve_ci: false` to a single `repos:` entry to opt that one repo out.
+> See [Security notes](#security-notes).
 
 Not sure what your check names are?
 After step 6, run the `scan-backstop` workflow and read its logs, or use the `checks` helper locally:
@@ -73,7 +80,7 @@ Only you can mint it (it's tied to your account).
 
 1. GitHub ▸ **Settings** ▸ **Developer settings** ▸ **Personal access tokens** ▸ **Fine-grained tokens** ▸ **Generate new token**.
 2. **Repository access** ▸ **Only select repositories** ▸ pick every repo you listed in `wheelhouse.config.yml` (and this repo too, if it is private).
-3. **Permissions** ▸ Repository permissions: **Contents → Read and write**, **Issues → Read and write**, **Pull requests → Read and write**.
+3. **Permissions** ▸ Repository permissions: **Actions → Read and write**, **Contents → Read and write**, **Issues → Read and write**, **Pull requests → Read and write**.
 4. Generate, copy the token.
 5. In **this** repo: **Settings** ▸ **Secrets and variables** ▸ **Actions** ▸ **New repository secret** ▸ name it exactly `FLEET_TOKEN`, paste the value.
 
@@ -120,7 +127,7 @@ You drive the queue three ways - whichever fits the decision:
 - **Quick calls - tick a checkbox.** Each card offers the relevant boxes (e.g. *Merge it*, *Approve the CI run*, *Close / decline*, *Hold*). Tick exactly one; the handler executes it and closes the card.
 - **Nuanced calls - comment a slash-command.** Reply on the card with one of:
   - `/merge` - merge the target PR.
-  - `/approve-ci` - approve the fork-CI run (security-gated; auto-held if it touches CI files).
+  - `/approve-ci` - approve the fork-CI run (security-gated; CI/action-file changes are held, while non-default bases and `pull_request_target` posture add warnings).
   - `/close` - close the target PR/issue.
   - `/decline <reason>` - post your reason on the target, then close it.
   - `/hold` - park the card (labels it `blocked`, leaves it for you to handle manually).
@@ -138,12 +145,23 @@ A head move also leaves a "target updated" comment so you know to re-review the 
 If you act before that refresh lands, a `/merge` (or a "merge it" comment) still refuses a stale head with a note.
 The scheduled backstop also self-heals: if the underlying PR/issue gets merged or closed elsewhere, its card is closed automatically on the next scan.
 If an open target no longer needs a maintainer decision, its pure pending card is closed too.
+By default the scan also **auto-approves fork-CI runs it proves safe** (`auto_approve_ci`, on unless you opt out), so an *Approve the CI run* card now appears only for risky or uncertain cases - a run that changes CI/action files, targets a non-default base branch, has unreadable safety state, hits an approval error, or whose repo has a `pull_request_target` workflow (see [Security notes](#security-notes)).
 
 ## Security notes
 
 - **Owner-only acting.** Anyone can open issues or comment on a public repo, but every acting path is owner-gated (`sender == repository_owner`, plus an optional `maintainer` override). Strangers' edits and comments are no-ops.
-- **Token scope.** The default `GITHUB_TOKEN` only reaches this repo and is used for all card activity (so it can't recursively re-trigger the handler). Acting on your other repos uses `FLEET_TOKEN`, which is never printed and only ever used in the one cross-repo step. Scope it to just your fleet.
+- **Token scope.** The default `GITHUB_TOKEN` only reaches this repo and is used for all card activity (so it can't recursively re-trigger the handler). Acting on your other repos uses `FLEET_TOKEN`, which is never printed and is only used in cross-repo scan, approval, execution, and read-only fetch steps. Scope it to just your fleet with Actions, Contents, Issues, and Pull requests read/write on the target repos.
 - **Fork-CI / pwn-request HOLD.** Approving a fork PR's CI runs that PR's own workflow/action code with your permissions. Any approval that touches `.github/workflows`, `.github/actions`, or `action.yml`/`action.yaml` is **held** for manual review, never auto-approved (it fails closed if the file list can't be read).
+- **Auto-approve of provably-safe fork CI (`auto_approve_ci`, DEFAULT ON).** To kill the repetitive "approve CI" clicks, the scan applies the *same* security gate *before* surfacing a card and auto-approves the runs it proves safe - so only risky or uncertain ones still raise a card.
+  Auto-approve is a strict **subset** of the manual gate: a run is auto-cleared only when there are **no** CI-execution file changes (above), the PR targets the repo default branch, the target repo's default branch runs **no** `pull_request_target` workflow, and all safety reads and approval calls succeed.
+  Every uncertainty fails closed to a card (unreadable PR files, a non-default PR base branch, unreadable workflows, or an approve error).
+  It runs in the cross-repo `FLEET_TOKEN` scan step and never writes a card; nothing is ever silently approved or dropped.
+  Set `auto_approve_ci: false` (globally or per repo) to disable it.
+  - **The `pull_request_target` caveat (stated plainly).**
+    This approval gates the fork's read-only `pull_request` CI run.
+    A `pull_request_target` workflow runs **automatically with your repo's secrets regardless of any approval**, so Wheelhouse cannot gate that vector by withholding approval.
+    What it *does* is refuse to *silently* auto-clear a repo that has such a workflow (it raises a card with a warning instead), and it flags **loudly** the genuine exploit shape - a `pull_request_target` workflow that also checks out the PR head (`ref: github.event.pull_request.head.*` / `github.head_ref`), which runs attacker-controlled code with your secrets.
+    Treat that flag as a prompt to fix the upstream workflow, not as something this approval can contain.
 - **LLM injection defense (both LLM side-jobs).** Only your own text ever reaches the LLM as instructions; the target diff/issue is passed as clearly-delimited untrusted data, and the LLM is never given `FLEET_TOKEN` or write access to a fleet repo. For `nl_decisions` the LLM only *maps* your comment to a structured choice that is re-validated against the per-kind action allowlist before the deterministic handler acts - so a prompt-injection in a target diff cannot make it merge or close anything you didn't ask for, and it is further restricted to a single file-writing tool (no shell, no `gh`).
 - **Public = world-readable.** A public Wheelhouse repo makes your queue and decisions visible to everyone. That transparency is a feature, but state it plainly to yourself before listing private work here; use a private repo if you need it.
 - **Least privilege.** Every workflow declares a minimal `permissions:` block, and each card is serialized with per-issue `concurrency` so concurrent ticks can't race.
@@ -158,7 +176,7 @@ If an open target no longer needs a maintainer decision, its pure pending card i
   Your `compliance_check` / `test_check_patterns` don't match your actual check names.
   Run the `checks` helper (step 2) to see the real names, and the scan logs surface a config warning when a gate-like check is present but unconfigured.
 - **A decision didn't execute.**
-  Almost always `FLEET_TOKEN` scope: it needs Contents + Issues + Pull requests (read & write) on the **target** repo. The card stays open with an error comment when an action fails.
+  Almost always `FLEET_TOKEN` scope: it needs Actions + Contents + Issues + Pull requests (read & write) on the **target** repo. The card stays open with an error comment when an action fails.
   A `/merge` that's refused with a "head moved" note is working as intended - re-scan and decide again.
 - **Cron lag.**
   The scheduled keep-current path runs hourly, but GitHub cron is best-effort and can be delayed.
@@ -182,7 +200,7 @@ wheelhouse.config.yml          the one file you edit
   deep-review.yml              (LLM side-job, inert) label -> Claude reviews the target -> comments back
   no-mistakes-required.yml     PR-to-main gate requiring the no-mistakes signature
 scripts/
-  wheelhouse_core.py           GraphQL scan, classify, dedup/overlap, security-gated CI approval
+  wheelhouse_core.py           GraphQL scan, classify, dedup/overlap, CI safety + auto-approval
   render_card.py               build the decision card; create/refresh/close cards in this repo
   apply_decision.py            parse a tick/slash/label/plain-English comment, execute it on the target repo
   build_item.py                normalize a dispatch payload into a card item
@@ -190,6 +208,7 @@ scripts/
 tests/test_decision.py         offline unit test for the parse/route logic (mocks the LLM)
 tests/test_card_refresh.py     offline unit test for refresh change detection, guards, and labels
 tests/test_reconcile.py        offline unit test for reconcile routing and self-healing
+tests/test_ci_autoapprove.py   offline unit test for CI safety and scan-time auto-approval
 docs/ONBOARDING.md             how to wire a source repo's dispatch (the fast path)
 ```
 

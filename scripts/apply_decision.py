@@ -38,8 +38,10 @@ Natural-language phases (gated on nl_decisions + CLAUDE_CODE_OAUTH_TOKEN):
 Security: the caller owner-gates the whole job; only owner-authored text ever
 reaches this script (and the LLM). Merge re-checks the PR head SHA against the
 card's state block and refuses if the PR moved. approve-ci routes through the
-security HOLD. The LLM never receives FLEET_TOKEN and never runs git/gh - it can
-only return the structured result that this deterministic code acts on.
+shared CI safety verdict: CI/action-file changes hard-hold, while non-default
+bases and `pull_request_target` posture add warnings. The LLM never receives
+FLEET_TOKEN and never runs git/gh - it can only return the structured result
+that this deterministic code acts on.
 """
 import json
 import os
@@ -77,7 +79,7 @@ BOT_LOGIN = "github-actions[bot]"
 # One-line description of each action verb, used to brief the LLM intent-mapper.
 VERB_HELP = {
     "merge": "merge the target PR",
-    "approve-ci": "approve the held fork-CI run (security-gated; auto-held if it touches CI files)",
+    "approve-ci": "approve the held fork-CI run (security-gated; CI/action-file changes hard-hold, while non-default bases and pull_request_target posture warn)",
     "close": "close the target PR/issue with no note",
     "decline": "post a short reason on the target, then close it (put the reason in free_text)",
     "hold": "park this card for manual handling (no action on the target)",

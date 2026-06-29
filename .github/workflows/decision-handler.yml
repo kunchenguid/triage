@@ -215,7 +215,8 @@ jobs:
           github_token: ${{ github.token }}
           labels: processing
 
-      # Execute on the TARGET repo. This is the ONLY step that uses FLEET_TOKEN.
+      # Execute writes to the TARGET repo under FLEET_TOKEN. The NL fetch above
+      # may also use FLEET_TOKEN, but only for read-only target context.
       - id: execute
         if: ${{ steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action' }}
         env:

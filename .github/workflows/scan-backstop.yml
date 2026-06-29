@@ -37,7 +37,8 @@ jobs:
       - name: Install deps
         run: pip install --quiet pyyaml
 
-      # Cross-repo read of the whole fleet requires FLEET_TOKEN.
+      # Cross-repo scan reads fleet state and may approve provably-safe fork-CI
+      # runs, so this step requires FLEET_TOKEN with Actions write scope.
       - name: Scan the fleet
         env:
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
