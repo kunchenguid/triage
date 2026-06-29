@@ -1,0 +1,29 @@
+name: Triage decision (machine)
+description: >-
+  Internal schema for the decision cards this hub creates automatically. You do
+  not normally open this by hand - cards are machine-rendered by render_card.py.
+  Its only job is to let issue-ops/parser recognise the "Your decision" section
+  as a checkboxes field and return it as {selected, unselected}.
+title: "[repo#number] decision"
+labels:
+  - needs-decision
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        This card is driven by GitHub Actions. Tick exactly one box, or reply
+        with a slash-command. Only the repository owner can drive the decision.
+  - type: checkboxes
+    id: decision
+    attributes:
+      # NOTE: this label MUST stay in sync with the "### Your decision" heading
+      # that render_card.py emits - issue-ops/parser matches sections to fields
+      # by exact heading text. The options below are the full union across card
+      # kinds; the parser reads the ACTUAL ticked lines from the card body, so
+      # this list is only for schema validity, not for matching.
+      label: Your decision
+      options:
+        - label: Merge it
+        - label: Approve the CI run (security-gated)
+        - label: Close / decline
+        - label: Hold - I'll handle this manually

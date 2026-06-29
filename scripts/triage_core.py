@@ -19,6 +19,7 @@ Usage:
   triage_core.py checks <repo>        list distinct check names on a repo's PRs (onboarding)
   triage_core.py authorized           print true/false: is $SENDER allowed to drive decisions?
   triage_core.py deep-review-enabled  print true/false: is deep_review on in config?
+  triage_core.py nl-decisions-enabled print true/false: is nl_decisions on in config?
   triage_core.py state <field>        print one field of the state block in $ISSUE_BODY
   triage_core.py repos                list configured repos
 
@@ -117,6 +118,7 @@ def load_config():
         "repos": by_name,
         "maintainer": (cfg.get("maintainer") or "").strip(),
         "deep_review": bool(cfg.get("deep_review", False)),
+        "nl_decisions": bool(cfg.get("nl_decisions", False)),
         "card_issues": bool(cfg.get("card_issues", False)),
     }
 
@@ -531,6 +533,10 @@ def cmd_deep_review_enabled():
     print("true" if load_config()["deep_review"] else "false")
 
 
+def cmd_nl_decisions_enabled():
+    print("true" if load_config()["nl_decisions"] else "false")
+
+
 def cmd_state(field):
     """Print one field of the state block in $ISSUE_BODY (for the deep-review workflow)."""
     st = parse_state_block(os.environ.get("ISSUE_BODY", ""))
@@ -551,6 +557,8 @@ def main():
         cmd_authorized()
     elif cmd == "deep-review-enabled":
         cmd_deep_review_enabled()
+    elif cmd == "nl-decisions-enabled":
+        cmd_nl_decisions_enabled()
     elif cmd == "state" and len(sys.argv) == 3:
         cmd_state(sys.argv[2])
     elif cmd == "repos":
