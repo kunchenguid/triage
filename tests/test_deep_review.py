@@ -167,6 +167,11 @@ def test_handler_investigate_wiring():
         run = str(inv.get("run", ""))
         check("handler: investigate clears the checkbox (re-triggerable)",
               "clear-checkbox" in run)
+        check("handler: investigate clears the current card body",
+              "gh issue view \"$ISSUE\" --json body --jq .body" in run
+              and "ISSUE_BODY_FILE=investigate_current_body.md" in run)
+        check("handler: investigate does not clear from the event payload",
+              "github.event.issue.body" not in yaml.safe_dump(inv.get("env", {})))
         check("handler: investigate dispatches deep-review.yml via workflow_dispatch",
               "workflow run deep-review.yml" in run)
         check("handler: investigate runs on the default token (no FLEET_TOKEN)",

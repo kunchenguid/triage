@@ -19,9 +19,10 @@ Phases, run as separate workflow steps so each uses the right token:
                FLEET_TOKEN for this step. Writes result_message/terminal_state
                to $GITHUB_OUTPUT.
 
-  clear-checkbox  Print $ISSUE_BODY with the $OPT_KEY checkbox un-ticked, so the
-               handler can rewrite a card after a non-consuming action and keep
-               it re-triggerable. No token, no side effects.
+  clear-checkbox  Print $ISSUE_BODY_FILE (or $ISSUE_BODY) with the $OPT_KEY
+               checkbox un-ticked, so the handler can rewrite a card after a
+               non-consuming action and keep it re-triggerable. No token, no
+               side effects.
 
 Natural-language phases (gated on nl_decisions + CLAUDE_CODE_OAUTH_TOKEN):
 
@@ -683,13 +684,21 @@ def cmd_nl_route():
 
 
 def cmd_clear_checkbox():
-    """Print $ISSUE_BODY with the $OPT_KEY checkbox un-ticked.
+    """Print $ISSUE_BODY_FILE (or $ISSUE_BODY) with the $OPT_KEY checkbox un-ticked.
 
     The handler uses this for the non-consuming investigate action: it re-renders
     the card with the box cleared (on the default GITHUB_TOKEN, so the edit never
     re-triggers the handler) so the card stays a pure `needs-decision` card the
     owner can investigate again after new commits."""
-    body = os.environ.get("ISSUE_BODY", "")
+    body_file = os.environ.get("ISSUE_BODY_FILE", "")
+    if body_file:
+        try:
+            with open(body_file, encoding="utf-8") as f:
+                body = f.read()
+        except OSError:
+            body = ""
+    else:
+        body = os.environ.get("ISSUE_BODY", "")
     key = os.environ.get("OPT_KEY", "")
     sys.stdout.write(clear_checkbox(body, key))
 

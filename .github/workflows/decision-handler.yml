@@ -106,14 +106,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
           OPT_KEY: ${{ steps.decide.outputs.investigate }}
         run: |
           set -uo pipefail
-          python scripts/apply_decision.py clear-checkbox > investigate_body.md
-          # Only rewrite the card if we produced a non-empty body (never wipe it).
-          if [ -s investigate_body.md ]; then
-            gh issue edit "$ISSUE" --body-file investigate_body.md || true
+          if gh issue view "$ISSUE" --json body --jq .body > investigate_current_body.md; then
+            ISSUE_BODY_FILE=investigate_current_body.md \
+              python scripts/apply_decision.py clear-checkbox > investigate_body.md
+            if [ -s investigate_body.md ] && ! cmp -s investigate_current_body.md investigate_body.md; then
+              gh issue edit "$ISSUE" --body-file investigate_body.md || true
+            fi
           fi
           if ! gh workflow run deep-review.yml -f issue="$ISSUE"; then
             gh issue comment "$ISSUE" --body \

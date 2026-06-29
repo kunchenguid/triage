@@ -26,6 +26,8 @@ Covers:
     invariant), and the triggering comment is excluded (it is the new
     instruction, passed separately).
 """
+import contextlib
+import io
 import json
 import os
 import sys
@@ -221,6 +223,38 @@ def test_clear_checkbox():
           ad.clear_checkbox("", "investigate") == "" and ad.clear_checkbox(body, "") == body)
 
 
+def test_clear_checkbox_reads_body_file():
+    stale = ("### Your decision\n"
+             "- [x] Investigate - deep review <!-- opt:investigate -->\n"
+             '<!-- wheelhouse-state: {"repo":"r","number":1,"head_sha":"old"} -->')
+    current = ("### Your decision\n"
+               "- [x] Investigate - deep review <!-- opt:investigate -->\n"
+               '<!-- wheelhouse-state: {"repo":"r","number":1,"head_sha":"new"} -->')
+    saved = {k: os.environ.get(k) for k in ("ISSUE_BODY", "ISSUE_BODY_FILE", "OPT_KEY")}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "body.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(current)
+        buf = io.StringIO()
+        try:
+            os.environ["ISSUE_BODY"] = stale
+            os.environ["ISSUE_BODY_FILE"] = path
+            os.environ["OPT_KEY"] = "investigate"
+            with contextlib.redirect_stdout(buf):
+                ad.cmd_clear_checkbox()
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    out = buf.getvalue()
+    check("clear: body file overrides stale env body",
+          '"head_sha":"new"' in out and '"head_sha":"old"' not in out)
+    check("clear: body file checkbox is un-ticked",
+          "- [ ] Investigate - deep review <!-- opt:investigate -->" in out)
+
+
 # --------------------------------------------------------------------------- #
 # natural-language path: mocked LLM result -> validated, deterministic outputs
 # --------------------------------------------------------------------------- #
@@ -398,6 +432,7 @@ def main():
     test_investigate_allow_set_and_nl_exclusion()
     test_nl_never_offers_or_accepts_investigate()
     test_clear_checkbox()
+    test_clear_checkbox_reads_body_file()
     test_action_mode_drives_execute()
     test_answer_and_clarify_do_not_execute()
     test_trust_boundary()
