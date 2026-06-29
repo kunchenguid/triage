@@ -117,6 +117,11 @@ def test_code_grounded_checkout_and_tool_isolation():
     doc = load_yaml(".github", "workflows", "deep-review.yml")
     steps = steps_of(doc, "deep-review")
 
+    checkouts = [s for s in steps if "actions/checkout" in str(s.get("uses", ""))]
+    check("security: every checkout disables credential persistence",
+          checkouts and all((s.get("with") or {}).get("persist-credentials") is False
+                            for s in checkouts))
+
     checkout = next((s for s in steps
                      if "actions/checkout" in str(s.get("uses", ""))
                      and isinstance(s.get("with"), dict)
