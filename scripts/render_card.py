@@ -239,6 +239,18 @@ def find_card(marker):
     return arr[0] if arr else None
 
 
+def get_card(number):
+    r = _gh(["issue", "view", str(number), "--json", "number,body,labels,state"],
+            check=False)
+    if r.returncode != 0:
+        return None
+    return json.loads(r.stdout or "{}") or None
+
+
+def issue_is_open(issue):
+    return str((issue or {}).get("state", "OPEN")).upper() == "OPEN"
+
+
 def _write_body(body):
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write(body)
@@ -303,7 +315,15 @@ def upsert_card(item, existing=None):
     Returns the issue number (or the created card's URL for a brand-new card)."""
     card = render(item)
     ensure_labels(card["labels"])
-    existing = existing or find_card(card["marker"])
+    known_number = (existing or {}).get("number")
+    if known_number:
+        existing = get_card(known_number)
+        if not existing or not issue_is_open(existing):
+            print("skip card #%s for %s: card no longer open"
+                  % (known_number, card["marker"]))
+            return known_number
+    else:
+        existing = find_card(card["marker"])
     if not existing:
         return _create_card(card)
 

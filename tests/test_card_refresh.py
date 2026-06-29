@@ -177,6 +177,43 @@ def test_is_refreshable_accepts_plain_strings():
           rc.is_refreshable(["needs-decision", "processing"]) is False)
 
 
+def test_upsert_refetches_known_card_before_refresh():
+    calls = {"refresh": 0, "create": 0}
+    existing = {
+        "number": 7,
+        "body": rc.render(item())["body"],
+        "labels": labels("needs-decision", "repo:lavish-axi", "kind:pr-review",
+                         "priority:med", "target:lavish-axi-42"),
+    }
+    current = {
+        "number": 7,
+        "body": existing["body"],
+        "labels": labels("needs-decision", "processing", "repo:lavish-axi",
+                         "kind:pr-review", "priority:med", "target:lavish-axi-42"),
+        "state": "OPEN",
+    }
+
+    old_get_card = rc.get_card
+    old_refresh = rc._refresh_card
+    old_create = rc._create_card
+    old_ensure = rc.ensure_labels
+    rc.get_card = lambda number: current if int(number) == 7 else None
+    rc._refresh_card = lambda *args: calls.__setitem__("refresh", calls["refresh"] + 1)
+    rc._create_card = lambda *args: calls.__setitem__("create", calls["create"] + 1)
+    rc.ensure_labels = lambda labels_: None
+    try:
+        result = rc.upsert_card(item(priority="high"), existing=existing)
+    finally:
+        rc.get_card = old_get_card
+        rc._refresh_card = old_refresh
+        rc._create_card = old_create
+        rc.ensure_labels = old_ensure
+
+    check("upsert: known card number is returned", result == 7)
+    check("upsert: current processing card is not refreshed", calls["refresh"] == 0)
+    check("upsert: current processing card does not duplicate", calls["create"] == 0)
+
+
 # --------------------------------------------------------------------------- #
 # label replace: stale managed labels removed, needs-decision + human kept
 # --------------------------------------------------------------------------- #
@@ -224,6 +261,7 @@ def main():
     test_is_refreshable_pure_needs_decision()
     test_is_refreshable_blocks_mid_decision()
     test_is_refreshable_accepts_plain_strings()
+    test_upsert_refetches_known_card_before_refresh()
     test_plan_label_update_replaces_stale_managed()
     test_plan_label_update_keeps_human_labels()
     test_plan_label_update_noop_when_identical()

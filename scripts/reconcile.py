@@ -39,6 +39,21 @@ def load(path):
         return json.load(f)
 
 
+def current_card(row):
+    card = render_card.get_card(row["number"])
+    if not card or not render_card.issue_is_open(card):
+        return None
+    state = core.parse_state_block(card.get("body", ""))
+    if not state:
+        return None
+    return {
+        "number": card["number"],
+        "body": card.get("body", ""),
+        "state": state,
+        "labels": card.get("labels", []),
+    }
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit("usage: reconcile.py scan.json cards.json")
@@ -93,7 +108,14 @@ def main():
         if not render_card.material_changed(item, ex["state"]):
             continue
         try:
-            render_card.upsert_card(item, existing=ex)
+            current = current_card(ex)
+            if current is None:
+                continue
+            if not render_card.is_refreshable(current["labels"]):
+                continue
+            if not render_card.material_changed(item, current["state"]):
+                continue
+            render_card.upsert_card(item, existing=current)
             refreshed += 1
         except Exception as e:
             print("::warning::failed to refresh card #%s for %s#%s: %s"
@@ -117,6 +139,23 @@ def main():
         if number in open_set:
             key = (repo, number)
             if key in worklist_keys or not render_card.is_refreshable(ex["labels"]):
+                continue
+            current = current_card(ex)
+            if current is None:
+                continue
+            state = current["state"]
+            repo = state.get("repo")
+            number = int(state.get("number", 0))
+            kind = state.get("kind", "pr-review")
+            r = repos.get(repo)
+            if not r or not r.get("ok"):
+                continue
+            open_set = set(r.get("open_pr_numbers", []) if kind in PR_KINDS
+                           else r.get("open_issue_numbers", []))
+            current_key = (repo, number)
+            if number not in open_set or current_key in worklist_keys:
+                continue
+            if not render_card.is_refreshable(current["labels"]):
                 continue
             msg = ("Self-healed by the scheduled backstop: %s#%s no longer needs "
                    "a maintainer decision in the current scan - consuming this "
