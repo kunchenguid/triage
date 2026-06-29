@@ -7,7 +7,9 @@ PR/issue with compliance + test status, classifies each deterministically, and
 emits a worklist of items that need the maintainer's decision. Also carries the
 security-gated CI approval (the fork-CI / pwn-request HOLD) and the scan-time
 auto-approval of provably-safe fork-CI runs (so only risky or uncertain ones
-raise a card).
+raise a card). The auto path logs exactly one stderr workflow-command line per
+CI-approval candidate it handles, so approve failures and fail-closed verdicts
+are visible in the scan-backstop run log.
 
 This is the GHA port of `data/triage/triage.py`. What the Actions model
 replaces has been dropped: the local single-flight lock (-> Actions
@@ -15,8 +17,8 @@ replaces has been dropped: the local single-flight lock (-> Actions
 state), per-repo `owner` (-> derived from github.repository_owner).
 
 Usage:
-  wheelhouse_core.py scan                 scan all configured repos -> JSON worklist; may auto-approve safe fork CI
-  wheelhouse_core.py scan <repo>          scan a single configured repo; may auto-approve safe fork CI
+  wheelhouse_core.py scan                 scan all configured repos -> JSON worklist; may auto-approve safe fork CI and log outcomes
+  wheelhouse_core.py scan <repo>          scan a single configured repo; may auto-approve safe fork CI and log outcomes
   wheelhouse_core.py approve-ci <repo> <pr>   security-gated fork-CI approval (exit 4 = HOLD)
   wheelhouse_core.py checks <repo>        list distinct check names on a repo's PRs (onboarding)
   wheelhouse_core.py authorized           print true/false: is $SENDER allowed to drive decisions?
@@ -392,8 +394,9 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
     defaulting True); a repo may override it per-repo. When enabled, a fork PR
     whose `ci_safety` verdict is provably safe is approved here (in the
     FLEET_TOKEN scan context) and emits NO card; everything risky/uncertain still
-    becomes a card. This runs only on the ok:true success path below, so an
-    ok:false repo (early return) is never auto-approved."""
+    becomes a card. Each handled ci-approval PR also emits exactly one stderr
+    notice/warning outcome line. This runs only on the ok:true success path
+    below, so an ok:false repo (early return) is never auto-approved."""
     name = repo_cfg["name"]
     slug = "%s/%s" % (owner, name)
     try:

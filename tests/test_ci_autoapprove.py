@@ -20,6 +20,9 @@ These tests cover:
     raises NO card, a risky/posture/error PR still raises a card (with a
     warning), an approve failure or exception falls back to a card, and an
     ok:false repo is never auto-approved;
+  * the scan-log observability contract: each auto-path CI-approval candidate
+    emits one notice when approved or one warning when carded, with the verdict
+    reason and any approve status/message;
   * idempotency by construction (a PR no longer `needs-ci-approval` is never
     re-approved), default-on, explicit opt-out, and the per-repo override.
 """
