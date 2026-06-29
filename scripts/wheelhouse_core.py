@@ -56,7 +56,7 @@ query($owner:String!, $name:String!) {
     pullRequests(states:OPEN, first:100, orderBy:{field:UPDATED_AT, direction:DESC}) {
       totalCount
       nodes {
-        number title isDraft updatedAt
+        number title isDraft updatedAt changedFiles
         author { login }
         headRefName headRefOid
         labels(first:20){ nodes{ name } }
@@ -317,7 +317,7 @@ def _ci_safety_note(verdict):
     return " ".join(parts)
 
 
-def _auto_approve_or_card(owner, name, pr_number, posture, auto_enabled):
+def _auto_approve_or_card(owner, name, pr_number, posture, auto_enabled, changed_files=None):
     """For one `needs-ci-approval` PR, decide auto-approve vs card.
 
     Returns (handled, note) where:
@@ -327,7 +327,7 @@ def _auto_approve_or_card(owner, name, pr_number, posture, auto_enabled):
         it (may be "").
     Fails CLOSED: any uncertainty (unsafe verdict, hold, approve error/exception)
     routes to a card so nothing is ever silently lost."""
-    verdict = ci_safety("%s/%s" % (owner, name), str(pr_number), posture)
+    verdict = ci_safety("%s/%s" % (owner, name), str(pr_number), posture, changed_files)
     if auto_enabled and verdict["safe"]:
         try:
             status, message = approve_ci(owner, name, str(pr_number), posture=posture)
@@ -378,6 +378,7 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
             "author": (pr.get("author") or {}).get("login", "?"),
             "comp": comp, "tests": tests, "ci": ci, "bucket": bucket,
             "closes": closes, "head_sha": pr["headRefOid"],
+            "changed_files": pr.get("changedFiles"),
         })
 
     open_issue_numbers = [it["number"] for it in issues]
@@ -408,7 +409,8 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
         if kind == "ci-approval":
             if posture is None:  # read the repo's workflows once, reuse per PR.
                 posture = repo_pr_target_posture(slug)
-            handled, note = _auto_approve_or_card(owner, name, pr["number"], posture, auto_enabled)
+            handled, note = _auto_approve_or_card(owner, name, pr["number"], posture,
+                                                  auto_enabled, pr.get("changed_files"))
             if handled:
                 print("::notice::%s#%s %s" % (name, pr["number"], note), file=sys.stderr)
                 continue  # provably safe (or nothing to approve) -> NO card
@@ -490,14 +492,24 @@ def _gh_api_capture(path):
     return subprocess.run(["gh", "api", path], capture_output=True, text=True)
 
 
-def _list_pr_files(slug, pr):
-    """Return (files, ok). ok=False means the listing failed (caller fails closed)."""
+def _changed_file_count(value):
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return count if count >= 0 else None
+
+
+def _list_pr_files(slug, pr, expected_count=None):
+    """Return (files, ok, complete). ok/complete=False means the caller fails closed."""
     out = subprocess.run(
         ["gh", "api", "--paginate", "/repos/%s/pulls/%s/files" % (slug, pr), "--jq", ".[].filename"],
         capture_output=True, text=True)
     if out.returncode != 0:
-        return ([], False)
-    return ([f.strip() for f in out.stdout.splitlines() if f.strip()], True)
+        return ([], False, False)
+    files = [f.strip() for f in out.stdout.splitlines() if f.strip()]
+    count = _changed_file_count(expected_count)
+    return (files, True, count is not None and len(files) >= count)
 
 
 def _risky_ci_files(files):
@@ -634,7 +646,7 @@ def repo_pr_target_posture(slug):
     return {"pr_target": pr_target, "exploit": exploit, "error": False}
 
 
-def ci_safety(slug, pr, repo_posture):
+def ci_safety(slug, pr, repo_posture, changed_files=None):
     """The shared safety verdict for approving a fork PR's awaiting CI run.
 
     Combines per-PR risky files with the per-repo `pull_request_target` posture
@@ -648,13 +660,16 @@ def ci_safety(slug, pr, repo_posture):
     exploit = bool(repo_posture.get("exploit"))
     posture_error = bool(repo_posture.get("error"))
 
-    files, ok = _list_pr_files(slug, pr)
-    if ok:
-        risky = _risky_ci_files(files)
-        file_error = False
-    else:
+    files, ok, complete = _list_pr_files(slug, pr, changed_files)
+    if not ok:
         risky = ["<could-not-list-files - failing closed>"]
         file_error = True
+    elif not complete:
+        risky = _risky_ci_files(files) + ["<could-not-list-all-files - failing closed>"]
+        file_error = True
+    else:
+        risky = _risky_ci_files(files)
+        file_error = False
 
     error = file_error or posture_error
     safe = not risky and not pr_target and not error
@@ -741,10 +756,11 @@ def approve_ci(owner, repo, pr, posture=None):
     head_sha = str(head.get("sha") or "")
     if not head_ref or not head_sha:
         return ("error", "pr fetch returned missing head ref/sha")
+    changed_files = pr_data.get("changed_files")
 
     if posture is None:
         posture = repo_pr_target_posture(slug)
-    verdict = ci_safety(slug, pr, posture)
+    verdict = ci_safety(slug, pr, posture, changed_files)
 
     # Risky CI-execution files (or an unreadable file list) -> HARD HOLD,
     # unchanged. A pull_request_target posture does NOT hard-block the manual

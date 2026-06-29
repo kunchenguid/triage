@@ -11,7 +11,7 @@ These tests cover:
 
   * the shared verdict `ci_safety` - risky-file HOLD, pull_request_target
     posture, the exploit-pattern flag, and every fail-closed branch (PR files
-    unreadable, workflows unreadable);
+    unreadable/incomplete, workflows unreadable);
   * the per-repo `pull_request_target` posture detection
     (`repo_pr_target_posture` + the pure `_on_triggers` / `_checks_out_pr_head`
     helpers), including the YAML 1.1 `on:`-parses-as-True gotcha and fail-closed
@@ -51,12 +51,16 @@ CLEAN_POSTURE = {"pr_target": False, "exploit": False, "error": False}
 # --------------------------------------------------------------------------- #
 # ci_safety: the ONE shared verdict (risky files + posture, fail closed)
 # --------------------------------------------------------------------------- #
-def safety(files, ok, posture):
+def safety(files, ok, posture, changed_files=None, complete=None):
     """Run ci_safety with a stubbed PR file list and a given repo posture."""
     save = core._list_pr_files
-    core._list_pr_files = lambda slug, pr: (files, ok)
+    if changed_files is None:
+        changed_files = len(files)
+    if complete is None:
+        complete = ok
+    core._list_pr_files = lambda slug, pr, expected_count: (files, ok, complete)
     try:
-        return core.ci_safety("o/r", "1", posture)
+        return core.ci_safety("o/r", "1", posture, changed_files)
     finally:
         core._list_pr_files = save
 
@@ -85,6 +89,15 @@ def test_ci_safety_file_list_error_fails_closed():
     check("ci_safety: unreadable PR files -> not safe", v["safe"] is False)
     check("ci_safety: unreadable PR files -> error flag", v["error"] is True)
     check("ci_safety: unreadable PR files -> a (sentinel) risky file", bool(v["risky_files"]))
+
+
+def test_ci_safety_file_list_truncation_fails_closed():
+    files = ["src/file%d.py" % i for i in range(3000)]
+    v = safety(files, True, CLEAN_POSTURE, changed_files=3001, complete=False)
+    check("ci_safety: incomplete PR file list -> not safe", v["safe"] is False)
+    check("ci_safety: incomplete PR file list -> error flag", v["error"] is True)
+    check("ci_safety: incomplete PR file list -> fail-closed sentinel",
+          "<could-not-list-all-files - failing closed>" in v["risky_files"])
 
 
 def test_ci_safety_pr_target_posture_blocks_auto():
@@ -233,7 +246,7 @@ def rollup(contexts):
 def pr_node(number, status_rollup, draft=False):
     return {
         "number": number, "title": "PR %d" % number, "isDraft": draft,
-        "updatedAt": "2026-01-01T00:00:00Z",
+        "updatedAt": "2026-01-01T00:00:00Z", "changedFiles": 1,
         "author": {"login": "contributor"},
         "headRefName": "feature-%d" % number, "headRefOid": "sha%d" % number,
         "labels": {"nodes": []},
@@ -271,7 +284,7 @@ def run_build_repo(pr_nodes, *, auto_approve_ci=True, repo_over=None, posture_va
         calls["posture"] += 1
         return CLEAN_POSTURE if posture_value is None else posture_value
 
-    def fake_ci_safety(slug, pr, repo_posture):
+    def fake_ci_safety(slug, pr, repo_posture, changed_files=None):
         calls["safety"].append((slug, pr))
         return SAFE_VERDICT if verdict is None else verdict
 
@@ -343,6 +356,46 @@ def test_ci_safety_error_raises_card():
     check("route: verdict error -> NOT auto-approved", calls["approve"] == [])
 
 
+def test_truncated_pr_file_list_routes_to_card():
+    pr = needs_ci_pr()
+    pr["changedFiles"] = 3001
+    calls = {"approve": []}
+
+    def fake_graphql(owner, name):
+        return graphql_data([pr])
+
+    def fake_run(cmd, capture_output=True, text=True):
+        if cmd[:3] == ["gh", "api", "--paginate"]:
+            files = ["src/file%d.py" % i for i in range(3000)]
+            return SimpleNamespace(returncode=0, stdout="\n".join(files), stderr="")
+        raise AssertionError(cmd)
+
+    def fake_approve(owner, name, pr_number, posture=None):
+        calls["approve"].append((owner, name, pr_number))
+        return ("approved", "approved 1 run")
+
+    save = (core.gh_graphql, core.repo_pr_target_posture, core.approve_ci, core.subprocess.run)
+    core.gh_graphql = fake_graphql
+    core.repo_pr_target_posture = lambda slug: CLEAN_POSTURE
+    core.approve_ci = fake_approve
+    core.subprocess.run = fake_run
+    try:
+        with redirect_stderr(io.StringIO()):
+            result, items = core.build_repo(
+                "owner",
+                {"name": "demo", "compliance_check": "Gate", "test_check_patterns": ["test"]},
+                False,
+                auto_approve_ci=True,
+            )
+    finally:
+        core.gh_graphql, core.repo_pr_target_posture, core.approve_ci, core.subprocess.run = save
+
+    check("route: truncated PR file list raises a card", len(items) == 1)
+    check("route: truncated PR file list is NOT auto-approved", calls["approve"] == [])
+    check("route: truncated PR file list warning fails closed",
+          "could-not-list-all-files" in (items[0].get("warning") or ""))
+
+
 def test_approve_failure_falls_back_to_card():
     result, items, calls = run_build_repo([needs_ci_pr()], approve_result=("error", "api fail"))
     check("route: approve error falls back to a card (nothing lost)", len(items) == 1)
@@ -398,7 +451,7 @@ def run_approve_ci(run_list_result, approval_results=None, run_details=None):
 
     save = (core.subprocess.run, core.ci_safety)
     core.subprocess.run = fake_run
-    core.ci_safety = lambda slug, pr, posture: SAFE_VERDICT
+    core.ci_safety = lambda slug, pr, posture, changed_files=None: SAFE_VERDICT
     try:
         status, message = core.approve_ci("o", "r", "1", posture=CLEAN_POSTURE)
         return status, message, calls
@@ -564,6 +617,7 @@ def main():
     test_ci_safety_clean_is_safe()
     test_ci_safety_risky_files_hold()
     test_ci_safety_file_list_error_fails_closed()
+    test_ci_safety_file_list_truncation_fails_closed()
     test_ci_safety_pr_target_posture_blocks_auto()
     test_ci_safety_exploit_flag_passthrough()
     test_ci_safety_posture_read_error_fails_closed()
@@ -580,6 +634,7 @@ def main():
     test_pr_target_posture_raises_card_with_warning()
     test_exploit_pattern_card_warns_loudly()
     test_ci_safety_error_raises_card()
+    test_truncated_pr_file_list_routes_to_card()
     test_approve_failure_falls_back_to_card()
     test_approve_noop_falls_back_to_card()
     test_approve_hold_falls_back_to_card()
