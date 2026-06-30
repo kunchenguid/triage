@@ -225,6 +225,7 @@ still appears where it's plain English, e.g. "triage the queue".)
   `ci-approval` card exactly as before, carrying the safety warning. **Fail closed
   everywhere**: an unsafe verdict, a `hold`/`error` from the approve, or an
   approve that throws all fall back to a card - nothing is silently dropped.
+  Fork-originated `action_required` workflow runs are expected to have an empty `workflow_run.pull_requests` list, so `approve_ci` verifies that fork case with the already-filtered run's exact `head_sha` plus `head_branch`; non-empty `pull_requests` stays strict and must contain exactly the target PR.
   **Observability (every outcome is logged, never silent).** `_auto_approve_or_card`
   returns `(handled, card_note, log_note)` and `build_repo` emits exactly ONE
   stderr line per `needs-ci-approval` PR the auto path handles: a `::notice::`
