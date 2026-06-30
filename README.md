@@ -4,6 +4,7 @@
 
 A personal, always-on, cross-repo **"what needs my decision"** command center, built entirely on GitHub Issues + GitHub Actions.
 Every issue in this repo is one pending decision about the repositories you maintain - a PR worth merging, a fork-CI run worth approving, an issue worth triaging.
+The scheduled scan keeps the queue focused on other people's work: PRs and issues authored by the repo owner, the configured maintainer, or bots stay out of the scan-built worklist, while missing author metadata fails open.
 You make final decisions by ticking a checkbox or replying in plain English; a workflow executes your call on the real repo and closes the card.
 No server, no database, no bot to host - just this repo and a couple of secrets.
 
@@ -57,9 +58,9 @@ repos:
     compliance_check: null
     test_check_patterns: ["ci", "test"]
 
-maintainer: ""         # optional extra login allowed to drive decisions; default = repo owner
+maintainer: ""         # optional extra login allowed to drive decisions and treated as your work
 nl_decisions: false    # LLM side-job: reply to a card in plain English (off by default)
-card_issues: false     # also card un-addressed issues, not just PRs (default: PRs only)
+card_issues: false     # also scan un-addressed issues, not just PRs; owner/maintainer/bot authors are skipped
 auto_approve_ci: true  # auto-approve provably-safe fork-CI runs (DEFAULT ON; see Security notes)
 # (Deep review has no flag - it's always available once CLAUDE_CODE_OAUTH_TOKEN is set.)
 ```
@@ -160,6 +161,7 @@ A head move also leaves a "target updated" comment so you know to re-review the 
 If you act before that refresh lands, a `/merge` (or a "merge it" comment) still refuses a stale head with a note.
 The scheduled backstop also self-heals: if the underlying PR/issue gets merged or closed elsewhere, its card is closed automatically on the next scan.
 If an open target no longer needs a maintainer decision, its pure pending card is closed too.
+That includes scan-built targets authored by the repo owner, the configured maintainer, or bots: they remain in the open target set but leave the worklist, so reconcile consumes any old pure pending card for them after a successful scan.
 By default the scan also **auto-approves fork-CI runs it proves safe** (`auto_approve_ci`, on unless you opt out), so an *Approve the CI run* card now appears only for contributor fork PRs with risky or uncertain cases - a run that changes CI/action files, targets a non-default base branch, has unreadable safety state, hits an approval error, has unknown fork status, or whose repo has a `pull_request_target` workflow (see [Security notes](#security-notes)).
 Owner, maintainer, and bot-authored fork PRs follow the same safe approve/noop path, but risky or uncertain cases are logged with `suppressed-card` and do not emit decision cards.
 Same-repo PRs with no CI signal are routed to normal PR review, not CI approval.
@@ -170,6 +172,9 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
 ## Security notes
 
 - **Owner-only acting.** Anyone can open issues or comment on a public repo, but every acting path is owner-gated (`sender == repository_owner`, plus an optional `maintainer` override). Strangers' edits and comments are no-ops.
+- **Queue author filter.** The scheduled scan creates decision cards for other people's work.
+  PRs and issues authored by the repo owner, the configured `maintainer`, or bots are excluded from the scan-built worklist; bot detection uses GitHub's author type plus the `[bot]` login suffix, and missing author metadata fails open so a real contributor is not silently dropped.
+  The explicit dispatch fast path trusts what your source workflow sends, so filter there too if you want it to match the scan.
 - **Token scope.** The default `GITHUB_TOKEN` only reaches this repo and is used for all card activity (so it can't recursively re-trigger the handler). Acting on your other repos uses `FLEET_TOKEN`, which is never printed and is only used in cross-repo scan, approval, execution, and read-only fetch steps. Scope it to just your fleet with Actions, Contents, Issues, and Pull requests read/write on the target repos.
 - **Fork-CI / pwn-request HOLD.** Approving a fork PR's CI runs that PR's own workflow/action code with your permissions. Any approval that touches `.github/workflows`, `.github/actions`, or `action.yml`/`action.yaml` is **held** for manual review, never auto-approved (it fails closed if the file list can't be read).
 - **Auto-approve of provably-safe fork CI (`auto_approve_ci`, DEFAULT ON).** To kill the repetitive "approve CI" clicks, the scan applies the *same* security gate *before* surfacing a card and auto-approves the runs it proves safe - so only risky or uncertain contributor PRs still raise a card.
@@ -203,6 +208,7 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
   Check that `FLEET_TOKEN` exists and is scoped to the repos in `wheelhouse.config.yml` (Settings ▸ Secrets and variables ▸ Actions).
   Confirm the repo names in the config are correct (names only, no `owner/` prefix).
   Run `scan-backstop` manually and read the logs - a repo that can't be read is reported as a warning and skipped, not fatal.
+  If the target is authored by the repo owner, the configured maintainer, or a bot, the scheduled scan intentionally leaves it out of the queue.
 - **Items look wrong (a non-compliant PR shows as merge-ready).**
   Your `compliance_check` / `test_check_patterns` don't match your actual check names.
   Run the `checks` helper (step 2) to see the real names, and the scan logs surface a config warning when a gate-like check is present but unconfigured.
@@ -244,7 +250,7 @@ wheelhouse.config.yml          the one file you edit
   deep-review.yml              always-on, code-grounded: Investigate box / label / manual issue run -> read-only target review -> workflow posts Claude's verdict
   no-mistakes-required.yml     PR-to-main gate requiring the no-mistakes signature
 scripts/
-  wheelhouse_core.py           GraphQL scan, classify, dedup/overlap, CI safety, auto-approval, and scan logs
+  wheelhouse_core.py           GraphQL scan, classify, author filtering, dedup/overlap, CI safety, auto-approval, and scan logs
   render_card.py               build the decision card; create/refresh/close cards in this repo
   apply_decision.py            parse a tick/slash/label/plain-English comment, execute it on the target repo
   build_item.py                normalize a dispatch payload into a card item

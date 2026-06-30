@@ -68,7 +68,9 @@ repos:
     test_check_patterns: ["build-and-test"]
 
 # Optional GitHub login allowed to drive decisions, in addition to the repo
-# owner. Leave empty to use the repository owner (github.repository_owner).
+# owner. The scheduled scan also treats this login as "your work" and skips
+# cards for PRs/issues it authored. Leave empty to use only the repository owner
+# (github.repository_owner).
 maintainer: ""
 
 # Code-grounded deep review is ALWAYS available (there is no enable flag). Tick
@@ -91,9 +93,11 @@ maintainer: ""
 nl_decisions: true
 
 # Whether the scheduled backstop also opens decision cards for open *issues*
-# that have no linked PR (in addition to PRs that need your call). Phase-1
-# default is PRs only (high signal); flip to true once you want issue triage in
-# the queue, or tick a card's "Investigate" box for a code-grounded read on it.
+# that have no linked PR (in addition to PRs that need your call). Issues
+# authored by the repo owner, configured maintainer, or bots are skipped by the
+# scan. Phase-1 default is PRs only (high signal); flip to true once you want
+# contributor issue triage in the queue, or tick a card's "Investigate" box for
+# a code-grounded read on it.
 card_issues: false
 
 # Auto-approve provably-safe fork-CI runs at scan time, so only risky or

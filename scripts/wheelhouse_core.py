@@ -4,7 +4,9 @@ Wheelhouse - deterministic brain (ported from the local OSS-triage machinery).
 
 Runs inside GitHub Actions. One GraphQL query per repo fetches every open
 PR/issue with compliance + test status, classifies each deterministically, and
-emits a worklist of items that need the maintainer's decision. Also carries the
+emits a worklist of items that need the maintainer's decision. The scan excludes
+known owner, configured maintainer, and bot authors from that worklist while
+failing open when author metadata is missing. Also carries the
 security-gated CI approval (the fork-CI / pwn-request HOLD) and the scan-time
 auto-approval of provably-safe fork-CI runs (so only contributor-authored risky
 or uncertain ones raise a card, excluded-author failures log suppressed-card,
@@ -412,7 +414,7 @@ def _author_is_bot(author):
 
 
 def _author_excluded_from_queue(author, maintainer_logins):
-    """Return true only when authorship is known to be maintainer or bot.
+    """Return true only when authorship is known to be owner/maintainer or bot.
 
     Missing author metadata fails open so a real contributor is not silently
     dropped from the maintainer's worklist.
@@ -542,6 +544,10 @@ def _auto_approve_or_card(
 
 def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
     """Scan one repo. Returns (repo_result, items).
+
+    Decision cards are for other people's work, so scan-built PR-review and
+    issue-triage items skip known owner/maintainer/bot authors. Missing author
+    metadata fails open.
 
     `auto_approve_ci` is the fleet-wide default (config `auto_approve_ci`, itself
     defaulting True); a repo may override it per-repo. Same-repo PRs with no CI
@@ -1395,8 +1401,8 @@ def maintainers():
     $OWNER / $GITHUB_REPOSITORY_OWNER) plus the optional configured `maintainer`.
 
     This is the SINGLE source of truth for "who is the maintainer" - the gate
-    (`authorized`) and the natural-language conversation-history filter both use
-    it, so trusted-author rules never drift apart."""
+    (`authorized`), the natural-language conversation-history filter, and the
+    scan author filter all use it, so trusted-author rules never drift apart."""
     owner = (
         os.environ.get("OWNER", "") or os.environ.get("GITHUB_REPOSITORY_OWNER", "")
     ).strip()
