@@ -7,9 +7,10 @@ PR/issue with compliance + test status, classifies each deterministically, and
 emits a worklist of items that need the maintainer's decision. Also carries the
 security-gated CI approval (the fork-CI / pwn-request HOLD) and the scan-time
 auto-approval of provably-safe fork-CI runs (so only risky or uncertain ones
-raise a card). The auto path logs exactly one stderr workflow-command line per
-CI-approval candidate it handles, so approve failures and fail-closed verdicts
-are visible in the scan-backstop run log.
+raise a card, and verified no-pending runs emit no stale card). The auto path
+logs exactly one stderr workflow-command line per CI-approval candidate it
+handles, so approvals, no-pending results, approve failures, and fail-closed
+verdicts are visible in the scan-backstop run log.
 Approval verifies each awaiting run against the target PR: populated
 workflow_run.pull_requests must name that PR, while fork-originated empty
 associations must match the PR head SHA and branch.
@@ -470,7 +471,7 @@ def _auto_approve_or_card(
         `log_note` is the per-PR outcome line for the scan-step `::warning::`.
     `log_note` ALWAYS carries the `ci_safety` verdict `reason`, plus - when an
     approve was attempted - the `approve_ci` `status` + `message`. That is what
-    makes a silent approve failure (`error`/`hold`/`noop`) impossible to hide in
+    makes a silent approve failure (`error`/`hold`) impossible to hide in
     the scan log; it is a logging string only (gh stderr/status text, never a
     token) and does NOT change the card body.
     Fails CLOSED: any uncertainty (unsafe verdict, hold, approve error/exception)
@@ -512,12 +513,15 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
     """Scan one repo. Returns (repo_result, items).
 
     `auto_approve_ci` is the fleet-wide default (config `auto_approve_ci`, itself
-    defaulting True); a repo may override it per-repo. When enabled, a fork PR
+    defaulting True); a repo may override it per-repo. Same-repo PRs with no CI
+    signal route to normal review, not CI approval. Unknown fork status keeps a
+    manual CI-approval card with no auto-approve attempt. When enabled, a fork PR
     whose `ci_safety` verdict is provably safe is approved here (in the
-    FLEET_TOKEN scan context) and emits NO card; everything risky/uncertain still
-    becomes a card. Each handled ci-approval PR also emits exactly one stderr
-    notice/warning outcome line. This runs only on the ok:true success path
-    below, so an ok:false repo (early return) is never auto-approved."""
+    FLEET_TOKEN scan context), or verified as having no pending run, and emits NO
+    card; everything risky/uncertain still becomes a card. Each handled
+    ci-approval PR also emits exactly one stderr notice/warning outcome line.
+    This runs only on the ok:true success path below, so an ok:false repo (early
+    return) is never auto-approved."""
     name = repo_cfg["name"]
     slug = "%s/%s" % (owner, name)
     try:

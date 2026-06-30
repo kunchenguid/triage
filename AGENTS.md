@@ -218,13 +218,15 @@ still appears where it's plain English, e.g. "triage the queue".)
   checks out the PR head (`_checks_out_pr_head`) is flagged LOUDLY as the exploit
   pattern (best-effort - parses jobs/steps; note the YAML 1.1 gotcha where the
   bare `on:` key parses as boolean `True`, handled in `_on_triggers`). In
-  `build_repo` (the `FLEET_TOKEN` scan context), for each `needs-ci-approval` PR:
-  if auto-approve is enabled AND the verdict is `safe` (no risky files, no
-  posture, no read error), call `approve_ci` and emit NO card (log a `::notice::`
-  to stderr - never stdout, which carries scan.json); otherwise emit the
-  `ci-approval` card exactly as before, carrying the safety warning. **Fail closed
-  everywhere**: an unsafe verdict, a `hold`/`error` from the approve, or an
-  approve that throws all fall back to a card - nothing is silently dropped.
+  `build_repo` (the `FLEET_TOKEN` scan context), for each fork
+  `needs-ci-approval` PR: if auto-approve is enabled AND the verdict is `safe`
+  (no risky files, no posture, no read error), call `approve_ci`; `approved` and
+  verified `noop` both emit NO card (log a `::notice::` to stderr - never stdout,
+  which carries scan.json), while `hold`/`error`/throw fall back to a
+  `ci-approval` card carrying the safety warning. Otherwise emit the
+  `ci-approval` card exactly as before, carrying the safety warning. **Fail
+  closed everywhere**: an unsafe verdict, a `hold`/`error` from the approve, or
+  an approve that throws all fall back to a card - nothing is silently dropped.
   `ci-approval` is fork-only: same-repo PRs with no CI signal route to
   `review-needed`, while unknown fork status fails safe by raising a manual
   `ci-approval` card with no auto-approve attempt.
@@ -236,16 +238,17 @@ still appears where it's plain English, e.g. "triage the queue".)
   **Observability (every outcome is logged, never silent).** `_auto_approve_or_card`
   returns `(handled, card_note, log_note)` and `build_repo` emits exactly ONE
   stderr line per `needs-ci-approval` PR the auto path handles: a `::notice::`
-  when approved, else a `::warning::wheelhouse auto-approve carded <repo>#<pr>:
-  <log_note>`. The `log_note` always carries the `ci_safety` verdict `reason`
-  and, when an approve was attempted, the `approve_ci` `status` + `message`
-  (e.g. `error: <gh stderr>`, `hold`, `noop`), so a real approve failure that
+  when approved or verified no-op, else a `::warning::wheelhouse auto-approve
+  carded <repo>#<pr>: <log_note>`. The `log_note` always carries the `ci_safety`
+  verdict `reason` and, when an approve was attempted, the `approve_ci` `status`
+  + `message` (e.g. `error: <gh stderr>`, `hold`), so a real approve failure that
   used to be swallowed into the card body is now visible in the scan-step log -
   the next `scan-backstop` run shows exactly why each safe-looking PR was not
-  approved. This is logging only: it never changes the verdict, the approve/card
-  decision, token usage, or fail-closed behavior, the `card_note` going into
-  `item["warning"]` is unchanged, and the line is gh stderr/status text, never a
-  secret value.
+  approved. Unknown fork status is logged as a carded warning with its uncertainty
+  reason before safety is attempted. This is logging only: it never changes the
+  verdict, the approve/card decision, token usage, or fail-closed behavior, the
+  `card_note` going into `item["warning"]` is unchanged, and the line is gh
+  stderr/status text, never a secret value.
   Idempotent by construction: once approved the next scan sees CI running/results
   (not `needs-ci-approval`), so it is not re-approved; a later push that adds a
   workflow file or flips the posture routes the PR back to a card. The auto path
