@@ -117,10 +117,10 @@ def scan_payload(items=None, open_pr_numbers=None, ok=True):
     }
 
 
-def card(labels_):
+def card(labels_, kind="pr-review"):
     return {
         "number": 7,
-        "body": body_state(),
+        "body": body_state(kind=kind),
         "labels": labels_,
         "title": "[wheelhouse#42] Ready PR",
     }
@@ -168,6 +168,34 @@ def test_open_target_that_left_worklist_is_consumed():
           "no longer needs a maintainer decision" in calls["close"][0]["message"])
 
 
+def test_ci_approval_card_with_no_pending_run_is_consumed():
+    calls = run_reconcile(
+        scan_payload(items=[]),
+        [card(labels("needs-decision", "repo:wheelhouse", "kind:ci-approval",
+                     "priority:med", "target:wheelhouse-42"),
+              kind="ci-approval")],
+    )
+    check("reconcile: stale ci-approval card is closed",
+          len(calls["close"]) == 1 and calls["close"][0]["number"] == 7)
+    check("reconcile: stale ci-approval close consumes the card",
+          "consuming this card" in calls["close"][0]["message"])
+
+
+def test_ci_approval_worklist_item_creates_fresh_card():
+    item = work_item(
+        kind="ci-approval",
+        bucket="needs-ci-approval",
+        comp="none",
+        tests="none",
+        recommendation="Approve CI to get a test signal.",
+    )
+    calls = run_reconcile(scan_payload(items=[item]), [])
+    check("reconcile: returned ci-approval item creates a fresh card",
+          len(calls["upsert"]) == 1 and calls["upsert"][0]["existing"] is None)
+    check("reconcile: fresh card is ci-approval",
+          calls["upsert"] and calls["upsert"][0]["item"]["kind"] == "ci-approval")
+
+
 def test_open_target_that_left_worklist_uses_current_labels_before_close():
     snapshot = card(labels("needs-decision", "repo:wheelhouse", "kind:pr-review",
                            "priority:med", "target:wheelhouse-42"))
@@ -196,6 +224,8 @@ def main():
     test_refresh_uses_known_card_when_target_label_missing()
     test_refresh_uses_current_labels_before_upsert()
     test_open_target_that_left_worklist_is_consumed()
+    test_ci_approval_card_with_no_pending_run_is_consumed()
+    test_ci_approval_worklist_item_creates_fresh_card()
     test_open_target_that_left_worklist_uses_current_labels_before_close()
     test_open_target_without_needs_decision_is_left_alone()
     print()

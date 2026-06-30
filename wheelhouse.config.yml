@@ -103,9 +103,13 @@ card_issues: false
 #     action.yml/.yaml) is NEVER auto-approved (the pwn-request HOLD), and
 #   * a repo whose base branch runs a `pull_request_target` workflow is never
 #     auto-cleared either - its CI-approval still raises a card (with a warning).
+# Same-repo PRs with no CI signal route to normal review, not CI approval.
+# Unknown fork status fails closed to a manual CI-approval card.
+# If the approval call verifies no matching run is awaiting approval, scan emits
+# no card and reconcile consumes any stale CI-approval card.
 # Everything uncertain fails closed to a card. The scan-backstop log records one
-# notice or warning for every auto-approve path outcome, including approval
-# failures that route back to a card.
+# notice or warning for every auto-approve path outcome, including no-pending
+# runs and approval failures that route back to a card.
 # The approval call also verifies each action_required workflow run against the
 # target PR: GitHub-populated pull_requests must name exactly that PR, and
 # fork-originated empty associations must match the PR head SHA plus head branch.
@@ -113,7 +117,7 @@ card_issues: false
 # workflow runs automatically with repo secrets and is NOT gated by any approval,
 # so the posture check is a "don't silently auto-clear + warn me" signal plus a
 # loud flag when such a workflow also checks out the PR head - not a block of
-# that vector. Set to false to opt out (every needs-ci-approval PR -> a card,
-# exactly as before). You can also override per repo with a `auto_approve_ci:
+# that vector. Set to false to opt out (every fork needs-ci-approval PR -> a
+# card, exactly as before). You can also override per repo with a `auto_approve_ci:
 # false` key on any entry under `repos:` above.
 auto_approve_ci: true

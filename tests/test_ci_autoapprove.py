@@ -18,8 +18,9 @@ These tests cover:
     read/parse errors;
   * the auto-approve-vs-card routing in `build_repo`: a safe PR is approved and
     raises NO card, a risky/posture/error PR still raises a card (with a
-    warning), an approve failure or exception falls back to a card, and an
-    ok:false repo is never auto-approved;
+    warning), an approve failure or exception falls back to a card, a verified
+    noop emits NO stale card, same-repo no-CI PRs route away from ci-approval,
+    and an ok:false repo is never auto-approved;
   * the scan-log observability contract: each auto-path CI-approval candidate
     emits one notice when approved or one warning when carded, with the verdict
     reason and any approve status/message;
@@ -367,21 +368,29 @@ def rollup(contexts):
     return {"state": "PENDING", "contexts": {"nodes": contexts}}
 
 
-def pr_node(number, status_rollup, draft=False, base_ref="main"):
-    return {
+def pr_node(number, status_rollup, draft=False, base_ref="main", cross_repo=True):
+    node = {
         "number": number,
         "title": "PR %d" % number,
         "isDraft": draft,
+        "isCrossRepository": cross_repo,
         "updatedAt": "2026-01-01T00:00:00Z",
         "changedFiles": 1,
         "author": {"login": "contributor"},
         "headRefName": "feature-%d" % number,
         "headRefOid": "sha%d" % number,
         "baseRefName": base_ref,
+        "headRepository": {"name": "demo-fork", "owner": {"login": "forker"}},
+        "baseRepository": {"name": "demo", "owner": {"login": "owner"}},
         "labels": {"nodes": []},
         "closingIssuesReferences": {"nodes": []},
         "commits": {"nodes": [{"commit": {"statusCheckRollup": status_rollup}}]},
     }
+    if cross_repo == "missing":
+        node.pop("isCrossRepository")
+        node.pop("headRepository")
+        node.pop("baseRepository")
+    return node
 
 
 def graphql_data(pr_nodes, default_branch="main"):
@@ -470,9 +479,9 @@ def run_build_repo(
     return result, items, calls
 
 
-def needs_ci_pr(number=1, base_ref="main"):
+def needs_ci_pr(number=1, base_ref="main", cross_repo=True):
     return pr_node(
-        number, None, base_ref=base_ref
+        number, None, base_ref=base_ref, cross_repo=cross_repo
     )  # no status rollup -> ci absent -> needs-ci-approval
 
 
@@ -489,6 +498,40 @@ def test_safe_pr_is_auto_approved_no_card():
         calls["approve"] and calls["approve"][0][4] is True,
     )
     check("route: repo result still ok", result["ok"] is True)
+
+
+def test_same_repo_no_ci_routes_to_review_needed_not_ci_approval():
+    pr = needs_ci_pr(cross_repo=False)
+    pr["headRepository"] = {"name": "demo", "owner": {"login": "owner"}}
+    pr["baseRepository"] = {"name": "demo", "owner": {"login": "owner"}}
+    result, items, calls = run_build_repo([pr])
+    check(
+        "route: same-repo no-CI PR is a pr-review card",
+        len(items) == 1 and items[0]["kind"] == "pr-review",
+    )
+    check(
+        "route: same-repo no-CI PR uses review-needed bucket",
+        items and items[0]["bucket"] == "review-needed",
+    )
+    check("route: same-repo no-CI PR is NOT auto-approved", calls["approve"] == [])
+    check("route: same-repo no-CI PR skips posture", calls["posture"] == 0)
+    check("route: same-repo no-CI PR skips ci_safety", calls["safety"] == [])
+
+
+def test_unknown_fork_status_keeps_ci_card_without_auto_approval():
+    result, items, calls = run_build_repo([needs_ci_pr(cross_repo="missing")])
+    warning = items[0].get("warning") if items else ""
+    check(
+        "route: unknown fork status keeps a ci-approval card",
+        len(items) == 1 and items[0]["kind"] == "ci-approval",
+    )
+    check(
+        "route: unknown fork status warns instead of guessing",
+        "could not determine" in (warning or ""),
+    )
+    check("route: unknown fork status is NOT auto-approved", calls["approve"] == [])
+    check("route: unknown fork status skips posture", calls["posture"] == 0)
+    check("route: unknown fork status skips ci_safety", calls["safety"] == [])
 
 
 def test_risky_pr_raises_card_not_approved():
@@ -655,14 +698,13 @@ def test_approve_failure_falls_back_to_card():
     )
 
 
-def test_approve_noop_falls_back_to_card():
+def test_approve_noop_consumes_stale_ci_approval_card():
     result, items, calls = run_build_repo(
-        [needs_ci_pr()], approve_result=("noop", "no matching runs")
+        [needs_ci_pr()], approve_result=("noop", "no workflow runs awaiting approval")
     )
-    check("route: approve noop falls back to a card (nothing lost)", len(items) == 1)
+    check("route: approve noop emits NO stale card", items == [])
     check(
-        "route: approve noop note is surfaced",
-        "auto-approve did not complete" in (items[0].get("warning") or ""),
+        "route: approve noop first checked the run state", len(calls["approve"]) == 1
     )
 
 
@@ -761,17 +803,23 @@ def test_auto_approved_multiline_message_is_logged_on_one_line():
     )
 
 
-def test_carded_approve_noop_is_logged_with_status():
+def test_noop_consumed_ci_approval_is_logged_with_status():
     result, items, calls = run_build_repo(
-        [needs_ci_pr()], approve_result=("noop", "no matching runs")
+        [needs_ci_pr()], approve_result=("noop", "no workflow runs awaiting approval")
     )
     err = calls["stderr"]
-    check("log: noop carded warning names the noop status", "approve_ci noop" in err)
-    check("log: noop carded warning surfaces the message", "no matching runs" in err)
+    check("log: noop consumed PR emits a ::notice::", "::notice::demo#1" in err)
+    check("log: noop notice names the noop status", "approve_ci noop" in err)
     check(
-        "log: noop carded warning still carries the verdict reason",
+        "log: noop notice surfaces the message",
+        "no workflow runs awaiting approval" in err,
+    )
+    check(
+        "log: noop notice still carries the verdict reason",
         "verdict safe (clean)" in err,
     )
+    check("log: noop consumed PR emits NO ::warning::", "::warning::" not in err)
+    check("log: noop consumed PR raises NO card", items == [])
 
 
 def test_carded_approve_exception_is_logged():
@@ -1298,6 +1346,8 @@ def main():
     test_posture_contents_listing_limit_fails_closed()
     test_posture_non_base64_workflow_file_fails_closed()
     test_safe_pr_is_auto_approved_no_card()
+    test_same_repo_no_ci_routes_to_review_needed_not_ci_approval()
+    test_unknown_fork_status_keeps_ci_card_without_auto_approval()
     test_risky_pr_raises_card_not_approved()
     test_pr_target_posture_raises_card_with_warning()
     test_exploit_pattern_card_warns_loudly()
@@ -1305,14 +1355,14 @@ def main():
     test_truncated_pr_file_list_routes_to_card()
     test_non_default_base_pr_raises_card_without_posture_read()
     test_approve_failure_falls_back_to_card()
-    test_approve_noop_falls_back_to_card()
+    test_approve_noop_consumes_stale_ci_approval_card()
     test_approve_hold_falls_back_to_card()
     test_approve_exception_falls_back_to_card()
     test_auto_approved_pr_emits_one_notice()
     test_carded_approve_error_is_logged_with_status_and_message()
     test_carded_approve_multiline_error_is_logged_on_one_line()
     test_auto_approved_multiline_message_is_logged_on_one_line()
-    test_carded_approve_noop_is_logged_with_status()
+    test_noop_consumed_ci_approval_is_logged_with_status()
     test_carded_approve_exception_is_logged()
     test_carded_unsafe_verdict_is_logged_without_approve_status()
     test_carded_disabled_auto_approve_is_logged()

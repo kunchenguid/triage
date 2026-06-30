@@ -7,9 +7,10 @@ PR/issue with compliance + test status, classifies each deterministically, and
 emits a worklist of items that need the maintainer's decision. Also carries the
 security-gated CI approval (the fork-CI / pwn-request HOLD) and the scan-time
 auto-approval of provably-safe fork-CI runs (so only risky or uncertain ones
-raise a card). The auto path logs exactly one stderr workflow-command line per
-CI-approval candidate it handles, so approve failures and fail-closed verdicts
-are visible in the scan-backstop run log.
+raise a card, and verified no-pending runs emit no stale card). The auto path
+logs exactly one stderr workflow-command line per CI-approval candidate it
+handles, so approvals, no-pending results, approve failures, and fail-closed
+verdicts are visible in the scan-backstop run log.
 Approval verifies each awaiting run against the target PR: populated
 workflow_run.pull_requests must name that PR, while fork-originated empty
 associations must match the PR head SHA and branch.
@@ -64,9 +65,11 @@ query($owner:String!, $name:String!) {
     pullRequests(states:OPEN, first:100, orderBy:{field:UPDATED_AT, direction:DESC}) {
       totalCount
       nodes {
-        number title isDraft updatedAt changedFiles
+        number title isDraft updatedAt changedFiles isCrossRepository
         author { login }
         headRefName headRefOid baseRefName
+        headRepository { name owner { login } }
+        baseRepository { name owner { login } }
         labels(first:20){ nodes{ name } }
         closingIssuesReferences(first:10){ nodes{ number } }
         commits(last:1){ nodes{ commit{ statusCheckRollup{
@@ -270,10 +273,40 @@ def check_status(pr, cfg):
     return (compliance, tstate, True, names)
 
 
-def classify(draft, comp, tests, ci):
+def _repo_identity(repo):
+    if not isinstance(repo, dict):
+        return None
+    owner = repo.get("owner")
+    owner_login = owner.get("login") if isinstance(owner, dict) else None
+    name = repo.get("name")
+    if not owner_login or not name:
+        return None
+    return (str(owner_login).lower(), str(name).lower())
+
+
+def _pr_is_cross_repo(pr):
+    """Return True/False when the PR source repo is known, else None.
+
+    Fork-CI approval is meaningful only for cross-repo PRs. Missing/deleted head
+    repository metadata is treated as unknown so the scan can fail safe instead
+    of silently closing or approving the wrong target.
+    """
+    direct = pr.get("isCrossRepository")
+    if isinstance(direct, bool):
+        return direct
+    head = _repo_identity(pr.get("headRepository"))
+    base = _repo_identity(pr.get("baseRepository"))
+    if head is None or base is None:
+        return None
+    return head != base
+
+
+def classify(draft, comp, tests, ci, cross_repo=True):
     if draft:
         return "draft"
     if not ci:
+        if cross_repo is False:
+            return "review-needed"
         return "needs-ci-approval"
     if comp == "fail":
         return "needs-reraise"
@@ -430,15 +463,15 @@ def _auto_approve_or_card(
     """For one `needs-ci-approval` PR, decide auto-approve vs card.
 
     Returns (handled, card_note, log_note) where:
-      * handled=True  -> the run was auto-approved; emit NO card. `card_note` is
-        unused (None) and `log_note` is the audit line for the scan-step
-        `::notice::`.
+      * handled=True  -> the run was auto-approved OR there is no pending run to
+        approve; emit NO card. `card_note` is unused (None) and `log_note` is
+        the audit line for the scan-step `::notice::`.
       * handled=False -> raise a card; `card_note` is the safety warning to
         surface on the card body (may be "", left EXACTLY as before), and
         `log_note` is the per-PR outcome line for the scan-step `::warning::`.
     `log_note` ALWAYS carries the `ci_safety` verdict `reason`, plus - when an
     approve was attempted - the `approve_ci` `status` + `message`. That is what
-    makes a silent approve failure (`error`/`hold`/`noop`) impossible to hide in
+    makes a silent approve failure (`error`/`hold`) impossible to hide in
     the scan log; it is a logging string only (gh stderr/status text, never a
     token) and does NOT change the card body.
     Fails CLOSED: any uncertainty (unsafe verdict, hold, approve error/exception)
@@ -454,7 +487,13 @@ def _auto_approve_or_card(
             status, message = ("error", "auto-approve raised: %s" % str(e)[:160])
         if status == "approved":
             return (True, None, "auto-approved (%s): %s" % (reason, message))
-        # hold / error / noop -> fall through to a card (fail-closed), keeping the why.
+        if status == "noop":
+            return (
+                True,
+                None,
+                "verdict safe (%s); approve_ci noop: %s" % (reason, message),
+            )
+        # hold / error -> fall through to a card (fail-closed), keeping the why.
         card_note = "auto-approve did not complete (%s: %s)" % (status, message)
         safety_note = _ci_safety_note(verdict)
         if safety_note:
@@ -474,12 +513,15 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
     """Scan one repo. Returns (repo_result, items).
 
     `auto_approve_ci` is the fleet-wide default (config `auto_approve_ci`, itself
-    defaulting True); a repo may override it per-repo. When enabled, a fork PR
+    defaulting True); a repo may override it per-repo. Same-repo PRs with no CI
+    signal route to normal review, not CI approval. Unknown fork status keeps a
+    manual CI-approval card with no auto-approve attempt. When enabled, a fork PR
     whose `ci_safety` verdict is provably safe is approved here (in the
-    FLEET_TOKEN scan context) and emits NO card; everything risky/uncertain still
-    becomes a card. Each handled ci-approval PR also emits exactly one stderr
-    notice/warning outcome line. This runs only on the ok:true success path
-    below, so an ok:false repo (early return) is never auto-approved."""
+    FLEET_TOKEN scan context), or verified as having no pending run, and emits NO
+    card; everything risky/uncertain still becomes a card. Each handled
+    ci-approval PR also emits exactly one stderr notice/warning outcome line.
+    This runs only on the ok:true success path below, so an ok:false repo (early
+    return) is never auto-approved."""
     name = repo_cfg["name"]
     slug = "%s/%s" % (owner, name)
     try:
@@ -507,7 +549,8 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
     for pr in prs:
         comp, tests, ci, names = check_status(pr, repo_cfg)
         all_names.update(names)
-        bucket = classify(pr["isDraft"], comp, tests, ci)
+        cross_repo = _pr_is_cross_repo(pr)
+        bucket = classify(pr["isDraft"], comp, tests, ci, cross_repo)
         closes = [i["number"] for i in pr["closingIssuesReferences"]["nodes"]]
         for i in closes:
             closing.setdefault(i, []).append(pr["number"])
@@ -524,6 +567,7 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
                 "head_sha": pr["headRefOid"],
                 "changed_files": pr.get("changedFiles"),
                 "base_ref": pr.get("baseRefName"),
+                "cross_repo": cross_repo,
             }
         )
 
@@ -560,6 +604,19 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
         }
 
         if kind == "ci-approval":
+            if pr.get("cross_repo") is not True:
+                item["warning"] = (
+                    "Wheelhouse could not determine whether this PR is from a "
+                    "fork, so it is leaving fork-CI approval for manual review "
+                    "instead of auto-approving or consuming the card."
+                )
+                print(
+                    "::warning::wheelhouse auto-approve carded %s#%s: "
+                    "fork status unknown; not auto-approved" % (name, pr["number"]),
+                    file=sys.stderr,
+                )
+                items.append(item)
+                continue
             posture = _non_default_base_posture(pr.get("base_ref"), default_branch)
             if posture is None:
                 if default_posture is None:
