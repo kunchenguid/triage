@@ -47,9 +47,11 @@ Security: the caller owner-gates the whole job; only owner-authored text ever
 reaches this script (and the LLM). Merge re-checks the PR head SHA against the
 card's state block and refuses if the PR moved. approve-ci routes through the
 shared CI safety verdict: CI/action-file changes hard-hold, while non-default
-bases and `pull_request_target` posture add warnings. The LLM never receives
-FLEET_TOKEN and never runs git/gh - it can only return the structured result
-that this deterministic code acts on.
+bases and `pull_request_target` posture add warnings, and each awaiting workflow
+run is bound to the PR by strict pull_requests association or fork fallback
+head SHA plus branch matching. The LLM never receives FLEET_TOKEN and never runs
+git/gh - it can only return the structured result that this deterministic code
+acts on.
 """
 import json
 import os

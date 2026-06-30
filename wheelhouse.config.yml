@@ -106,6 +106,9 @@ card_issues: false
 # Everything uncertain fails closed to a card. The scan-backstop log records one
 # notice or warning for every auto-approve path outcome, including approval
 # failures that route back to a card.
+# The approval call also verifies each action_required workflow run against the
+# target PR: GitHub-populated pull_requests must name exactly that PR, and
+# fork-originated empty associations must match the PR head SHA plus head branch.
 # Caveat: this gates the fork `pull_request` run only. A `pull_request_target`
 # workflow runs automatically with repo secrets and is NOT gated by any approval,
 # so the posture check is a "don't silently auto-clear + warn me" signal plus a

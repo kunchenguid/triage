@@ -10,6 +10,9 @@ auto-approval of provably-safe fork-CI runs (so only risky or uncertain ones
 raise a card). The auto path logs exactly one stderr workflow-command line per
 CI-approval candidate it handles, so approve failures and fail-closed verdicts
 are visible in the scan-backstop run log.
+Approval verifies each awaiting run against the target PR: populated
+workflow_run.pull_requests must name that PR, while fork-originated empty
+associations must match the PR head SHA and branch.
 
 This is the GHA port of `data/triage/triage.py`. What the Actions model
 replaces has been dropped: the local single-flight lock (-> Actions
@@ -782,6 +785,13 @@ def _approve_warning_suffix(verdict):
 
 
 def _workflow_run_matches_pr(slug, run_id, pr, head_sha, head_ref):
+    """Verify a candidate action_required workflow run belongs to the PR.
+
+    GitHub usually fills workflow_run.pull_requests, which must contain exactly
+    the target PR. For fork-originated action_required runs GitHub may return an
+    empty list, so the fallback binding is the already-filtered run detail's
+    exact head SHA plus head branch.
+    """
     r = _gh_api_capture("/repos/%s/actions/runs/%s" % (slug, run_id))
     if r.returncode != 0:
         return (None, "run detail fetch failed: %s" % r.stderr.strip()[:160])
@@ -825,6 +835,9 @@ def approve_ci(owner, repo, pr, posture=None, strict=False):
     it is computed here. The security verdict is `ci_safety` - the SAME definition
     the auto path uses. With `strict=True`, approval-time safety is re-read and
     any non-safe verdict blocks approval.
+    Each action_required run must also verify against the PR head: populated
+    pull_requests associations stay strict, while fork-originated empty
+    associations are accepted only on matching head SHA plus head branch.
 
     Returns (status, message). status in:
       approved - one or more runs approved
