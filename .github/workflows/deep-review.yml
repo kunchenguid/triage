@@ -1,12 +1,18 @@
 name: deep-review
 
-# Code-grounded deep review - ALWAYS AVAILABLE, triggered by the owner per card.
+# Code-grounded deep review - ALWAYS AVAILABLE, triggered by an authorized maintainer per card.
 #
-# Two ways in, one investigation path:
+# Three ways in, one investigation path:
 #   * tick the "Investigate" box on a pr-review / issue-triage card
 #     (decision-handler.yml dispatches this workflow, non-consuming), or
-#   * apply the `needs-deep-review` label to a card by hand.
-# Either way this workflow checks out the TARGET repo's code read-only, runs
+#   * have the repo owner apply the `needs-deep-review` label to a card by hand,
+#     or
+#   * have the repo owner run workflow_dispatch with only `issue=<card>` for
+#     direct verification.
+# Bot-dispatched Investigate runs carry immutable target coordinates from the
+# tick event. Issue-only manual runs and label runs parse the current card body
+# with this repo's token.
+# In each case this workflow checks out the TARGET repo's code read-only, runs
 # Claude over it, captures Claude's final response from the action output, and
 # posts that merit / triage verdict as a card comment.
 #
@@ -25,6 +31,9 @@ name: deep-review
 #     code is on disk it just READS files - it is restricted to Read / Grep /
 #     Glob, so it can explore but can never write files or execute the target's
 #     code (no build / test / install).
+#   * The Claude action allows only `github-actions[bot]` as a bot actor, solely
+#     so maintainer-gated Investigate dispatches from github.token can run. Never
+#     widen this to `*` or to any external bot actor.
 #   * Injection model: only this workflow's prompt text is an instruction; the
 #     decision card, target code, diff, and issue are delimited UNTRUSTED data.
 #     The verdict is posted with THIS repo's token (github.token), never
@@ -40,14 +49,14 @@ on:
         description: "Decision-card issue number to deep-review"
         required: true
       repo:
-        description: "Target repo name from the decision-card state"
-        required: true
+        description: "Target repo name from the decision-card state (optional; omit to parse issue)"
+        required: false
       number:
-        description: "Target PR or issue number from the decision-card state"
-        required: true
+        description: "Target PR or issue number from the decision-card state (optional; omit to parse issue)"
+        required: false
       kind:
-        description: "Decision-card kind"
-        required: true
+        description: "Decision-card kind (optional; omit to parse issue)"
+        required: false
       head_sha:
         description: "Target PR head SHA from the decision-card state"
         required: false
@@ -62,12 +71,12 @@ concurrency:
 
 jobs:
   deep-review:
-    # Owner-gate the trigger. The manual label path requires the owner. The
-    # workflow_dispatch path is GitHub-restricted to write-access users already,
-    # and the only programmatic caller is decision-handler.yml's owner-gated
-    # "Investigate" step (which dispatches via github.token, so it appears as the
-    # `github-actions[bot]` actor) - so accept the owner or a bot run triggered
-    # by the bot or owner, never an arbitrary collaborator.
+    # Gate the trigger. The manual label and issue-only workflow_dispatch
+    # paths require the owner. The complete workflow_dispatch path is also used
+    # by decision-handler.yml's maintainer-gated "Investigate" step, which
+    # dispatches via github.token and appears as the `github-actions[bot]` actor.
+    # Accept the owner or that bot run triggered by the bot or owner, never an
+    # arbitrary collaborator.
     if: >
       (
         github.event_name == 'workflow_dispatch' &&
@@ -104,7 +113,7 @@ jobs:
       - name: Install deps
         run: pip install --quiet pyyaml
 
-      # Resolve the target card's issue number (label event vs manual dispatch).
+      # Resolve the target card's issue number (label event vs workflow_dispatch).
       # No token needed - it is read straight off the event - so it is available
       # even on the token-absent path below.
       - id: target
@@ -132,27 +141,39 @@ jobs:
           gh issue comment "$ISSUE" --body \
             "Deep-review needs CLAUDE_CODE_OAUTH_TOKEN configured to run." || true
 
-      # Resolve the target coordinates and the ref to check out: a PR's head for a
-      # review/ci card, the default branch for an issue-triage card.
+      # Resolve the target coordinates and the ref to check out. Complete
+      # workflow_dispatch runs use immutable inputs from decision-handler's
+      # Investigate event; issue-only manual dispatches and label events parse
+      # the current card body.
       - id: resolve
         if: steps.gate.outputs.enabled == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           EVENT_ISSUE_BODY: ${{ github.event.issue.body }}
+          INPUT_ISSUE: ${{ github.event.inputs.issue }}
           INPUT_REPO: ${{ github.event.inputs.repo }}
           INPUT_NUMBER: ${{ github.event.inputs.number }}
           INPUT_KIND: ${{ github.event.inputs.kind }}
           INPUT_HEAD_SHA: ${{ github.event.inputs.head_sha }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] &&
+             [ -n "$INPUT_REPO" ] &&
+             [ -n "$INPUT_NUMBER" ] &&
+             [ -n "$INPUT_KIND" ]; then
             repo="$INPUT_REPO"
             number="$INPUT_NUMBER"
             kind="$INPUT_KIND"
             head_sha="$INPUT_HEAD_SHA"
           else
-            export ISSUE_BODY="$EVENT_ISSUE_BODY"
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              ISSUE_BODY="$(gh issue view "$INPUT_ISSUE" --json body --jq .body)"
+            else
+              ISSUE_BODY="$EVENT_ISSUE_BODY"
+            fi
+            export ISSUE_BODY
             repo="$(python scripts/wheelhouse_core.py state repo)"
             number="$(python scripts/wheelhouse_core.py state number)"
             kind="$(python scripts/wheelhouse_core.py state kind)"
@@ -311,6 +332,12 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
+          # The Investigate checkbox is maintainer-gated in decision-handler.yml,
+          # then dispatches this workflow with github.token. That makes the
+          # Claude action see github-actions[bot] as the actor and reject the run
+          # before it emits execution_file unless this exact bot is allowed.
+          # Keep this narrow: never use `*`, and never add external bot actors.
+          allowed_bots: github-actions[bot]
           prompt: ${{ steps.prepare.outputs.prompt }}
           claude_args: |
             --allowedTools Read,Grep,Glob

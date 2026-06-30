@@ -94,7 +94,8 @@ That is the only secret the deterministic machine needs.
 Skip this for the deterministic machine.
 Two independent Claude-powered features share one token (`CLAUDE_CODE_OAUTH_TOKEN`):
 
-- **Deep review (always-on)** - tick a card's *Investigate* box, or apply the `needs-deep-review` label, and Claude reviews the target's checked-out code with read-only tools.
+- **Deep review (always-on)** - tick a card's *Investigate* box and Claude reviews the target's checked-out code with read-only tools.
+  The repo owner can also apply the `needs-deep-review` label or run the `deep-review` workflow with only the decision-card issue number; that manual workflow path fetches the current card body with this repo's token.
   The workflow captures Claude's final response and posts it as the code-grounded merit/triage verdict.
   There is **no flag** - it runs whenever you trigger it, as long as the token is set.
   With the token missing it posts a one-line "needs token" note on the card so you know why nothing ran.
@@ -136,7 +137,7 @@ You drive the queue three ways - whichever fits the decision:
   It is the one tick that **does not consume the card**: it kicks off a code-grounded deep review, captures Claude's final response from the action output, posts that merit/triage verdict as a comment, and leaves the card open with the box cleared, so you can investigate again after new commits and still make your real call afterwards.
   (CI-approval cards don't offer it - that's a fast security gate, not a merit review.)
   It needs `CLAUDE_CODE_OAUTH_TOKEN` (see [step 4](#4-optional-add-the-claude-token-for-the-llm-features)); without it the card just gets a one-line "needs token" note.
-  Applying the `needs-deep-review` label by hand does the same thing.
+  The repo owner can also apply the `needs-deep-review` label by hand or run the `deep-review` workflow from Actions with only the card issue number; those manual paths parse the current card body before resolving the target.
 - **Nuanced calls - comment a slash-command.** Reply on the card with one of:
   - `/merge` - merge the target PR.
   - `/approve-ci` - approve the fork-CI run (security-gated; CI/action-file changes are held, while non-default bases and `pull_request_target` posture add warnings).
@@ -184,9 +185,10 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
 - **LLM injection defense (both LLM features).** Only your own text ever reaches the LLM as instructions; the target diff/issue is passed as clearly-delimited untrusted data, and the LLM is never given `FLEET_TOKEN` or write access to a fleet repo. For `nl_decisions` the LLM only *maps* your comment to a structured choice that is re-validated against the per-kind action allowlist before the deterministic handler acts - so a prompt-injection in a target diff cannot make it merge or close anything you didn't ask for, and it is further restricted to a single file-writing tool (no shell, no `gh`).
 - **Deep review is code-grounded but sandboxed.** To review the real code, deep review checks out the target repo into the runner using `FLEET_TOKEN` - but only for the clone, with `persist-credentials: false`, so **no token is ever written to disk**.
   The Claude step that follows gets only the model credential and this repo's token (never `FLEET_TOKEN`), and is restricted to **read-only** tools (`Read`/`Grep`/`Glob`) - it has **no shell, cannot write files, and cannot build, test, install, or otherwise execute** the target's code.
+  Because Investigate dispatches this workflow with `github.token`, the Claude action allows only `github-actions[bot]` as a bot actor; wildcard or external bot actors are not allowed.
   The workflow captures Claude's final response from the action output and posts the verdict with the default token.
   So a malicious PR that tries to prompt-inject through its own source can at worst produce a wrong verdict comment - never run code or exfiltrate a secret.
-  The trigger is owner-gated like every other acting path.
+  The Investigate trigger is owner/maintainer-gated like every other acting path, while direct manual label and issue-only workflow runs remain repo-owner-only.
 - **Public = world-readable.** A public Wheelhouse repo makes your queue and decisions visible to everyone. That transparency is a feature, but state it plainly to yourself before listing private work here; use a private repo if you need it.
 - **Least privilege.** Every workflow declares a minimal `permissions:` block, and each card is serialized with per-issue `concurrency` so concurrent ticks can't race.
 
@@ -219,7 +221,8 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
   It has no enable flag - it only needs `CLAUDE_CODE_OAUTH_TOKEN`.
   If that secret is missing, the card gets a one-line "Deep-review needs CLAUDE_CODE_OAUTH_TOKEN configured to run." note instead of a verdict; add the secret (see [step 4](#4-optional-add-the-claude-token-for-the-llm-features)).
   If the card says "Deep review ran but produced no verdict", the workflow could not extract usable output from Claude's action log and the run fails intentionally; check the **deep-review** workflow logs.
-  If you ticked *Investigate* and nothing happened at all, confirm you're the repo owner (the trigger is owner-gated) and check the **deep-review** workflow run in the Actions tab.
+  For direct verification, the repo owner can run **Actions** ▸ **deep-review** ▸ **Run workflow** with just the decision-card issue number; the workflow fetches the current card body before resolving the target.
+  If you ticked *Investigate* and nothing happened at all, confirm you're the repo owner or configured `maintainer` and check the **deep-review** workflow run in the Actions tab.
 
 ## Repo layout
 
@@ -232,7 +235,7 @@ wheelhouse.config.yml          the one file you edit
   ingest.yml                   repository_dispatch / manual -> create or refresh a decision card
   decision-handler.yml         your tick / slash-command / plain-English reply -> execute on the target -> close the card
   scan-backstop.yml            hourly scan -> create, refresh, or close cards against live repo state
-  deep-review.yml              always-on, code-grounded: Investigate box / label -> read-only target review -> workflow posts Claude's verdict
+  deep-review.yml              always-on, code-grounded: Investigate box / label / manual issue run -> read-only target review -> workflow posts Claude's verdict
   no-mistakes-required.yml     PR-to-main gate requiring the no-mistakes signature
 scripts/
   wheelhouse_core.py           GraphQL scan, classify, dedup/overlap, CI safety, auto-approval, and scan logs

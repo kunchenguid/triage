@@ -176,10 +176,11 @@ still appears where it's plain English, e.g. "triage the queue".)
   `actions: write`. The dispatch carries the parsed `repo`/`number`/`kind`/
   `head_sha` from the tick event, and `deep-review.yml` uses those immutable
   inputs for bot-dispatched runs instead of re-reading the mutable card body.
-  The manual `needs-deep-review` label path is unchanged (a human applying it
-  raises the `labeled` event normally) and remains the only path that parses the
-  card body in `deep-review.yml`.
-  This is a deliberate asymmetry: the manual `needs-deep-review` label path authorizes only the repository owner.
+  Owner-triggered `workflow_dispatch` can also be run with only `issue=...` for direct verification; that path fetches and parses the current card body with `github.token`.
+  The Claude action has `allowed_bots: github-actions[bot]` for the decision-handler dispatch only, because otherwise `anthropics/claude-code-action` rejects the `github.token`-dispatched bot run before it emits `execution_file`.
+  Keep that allow-list exact - never `*` and never an external bot actor.
+  The manual `needs-deep-review` label path is unchanged (a human applying it raises the `labeled` event normally) and remains a card-body parse path in `deep-review.yml`, alongside owner-triggered issue-only `workflow_dispatch` verification runs.
+  This is a deliberate asymmetry: the manual label and issue-only workflow-dispatch paths authorize only the repository owner.
   A configured co-maintainer uses the Investigate checkbox, which runs through the maintainer-gated decision-handler (`wheelhouse_core.maintainers()` = owner + configured maintainer).
   `investigate` is in the
   per-kind `ALLOWED` set but is filtered out of the NL verb list/validation
@@ -287,9 +288,11 @@ API key) and the same injection model (only owner-authored text is an
 instruction; target content is delimited untrusted data; the LLM gets only this
 repo's token, never `FLEET_TOKEN`):
 
-- **`deep-review.yml` - ALWAYS-ON, code-grounded (no enable flag).** Triggered by ticking the **Investigate** box on a card or applying the `needs-deep-review` label.
+- **`deep-review.yml` - ALWAYS-ON, code-grounded (no enable flag).** Triggered by ticking the **Investigate** box on a card, by the repo owner applying the `needs-deep-review` label, or by the repo owner running `workflow_dispatch` with only `issue=...` for direct verification.
+  Bot-dispatched Investigate runs use the immutable target inputs passed by `decision-handler.yml`; owner issue-only runs and manual label runs parse the current card body with `github.token`.
   It checks out the TARGET's code read-only (`FLEET_TOKEN`, `persist-credentials: false`, the PR head for a review card / the default branch for an issue card) and runs Claude restricted to `--allowedTools Read,Grep,Glob` over that checkout - so it traces real code paths, never just the diff, and can NEVER write files or execute the target's code (no Bash, no build/test).
   Claude does not write a verdict file.
+  The Claude action allows only `github-actions[bot]` as a bot actor so the maintainer-gated Investigate dispatch can pass; it must not allow `*` or any external bot actor.
   Its final response is captured from the action's `execution_file` output by preferring the clean `type: "result"` event's `result` string, falling back to the last assistant text, and the trusted workflow step posts that text as a card comment with `github.token`.
   If no usable output is present, the workflow posts "Deep review ran but produced no verdict (see the workflow run logs)." and fails the run.
   The ONLY gate is `CLAUDE_CODE_OAUTH_TOKEN`: when it is ABSENT the workflow posts a one-line "Deep-review needs CLAUDE_CODE_OAUTH_TOKEN configured to run." note instead of silently no-opping.
@@ -316,8 +319,9 @@ verdict, `pull_request_target` posture detection, and the auto-approve-vs-card r
 `python tests/test_deep_review.py` - the always-on/code-grounded deep-review +
 Investigate wiring: render options, the removed enable flag, the token-absent
 note, the `persist-credentials: false` checkout + read-only tool isolation, the
-action-output verdict capture, and the handler's `workflow_dispatch` trigger,
-all by inspecting the scripts/YAML, no network), and
+narrow `allowed_bots`, the action-output verdict capture, issue-only manual
+dispatch, and the handler's immutable-input `workflow_dispatch` trigger, all by
+inspecting the scripts/YAML, no network), and
 YAML-parse `.github/workflows/*.yml` + `wheelhouse.config.yml` +
 `.github/ISSUE_TEMPLATE/*.yml` (run `actionlint` if available; fetch the binary
 via its `download-actionlint.bash` if not). The live LLM paths (deep-review,
