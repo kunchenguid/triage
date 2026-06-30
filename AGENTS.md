@@ -176,6 +176,8 @@ still appears where it's plain English, e.g. "triage the queue".)
   `actions: write`. The dispatch carries the parsed `repo`/`number`/`kind`/
   `head_sha` from the tick event, and `deep-review.yml` uses those immutable
   inputs for bot-dispatched runs instead of re-reading the mutable card body.
+  To make direct verification possible, owner-triggered `workflow_dispatch` may be run with only `issue=...`; that path fetches and parses the current card body with `github.token`.
+  The Claude action has `allowed_bots: github-actions[bot]` for the decision-handler dispatch only, because otherwise `anthropics/claude-code-action` rejects the `github.token`-dispatched bot run before it emits `execution_file`.
   The manual `needs-deep-review` label path is unchanged (a human applying it
   raises the `labeled` event normally) and remains the only path that parses the
   card body in `deep-review.yml`.

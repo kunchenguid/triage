@@ -18,8 +18,10 @@ so these tests pin the *wiring* instead:
   * code-grounded + security: deep-review.yml checks out the target with
     FLEET_TOKEN and `persist-credentials: false`, runs Claude restricted to
     read-only exploration tools (Read/Grep/Glob), and the Claude step never
-    receives FLEET_TOKEN; the trusted post step captures the action's final
-    output from `execution_file` and posts it with the default token;
+    receives FLEET_TOKEN; it narrowly allows only the GitHub Actions bot because
+    owner-gated Investigate dispatches this workflow via github.token; the
+    trusted post step captures the action's final output from `execution_file`
+    and posts it with the default token;
   * prompt boundary: the mutable decision card, target diff/issue text, and
     target code are all presented as delimited untrusted data;
   * investigate trigger: decision-handler.yml keeps `actions: write` only on an
@@ -234,6 +236,14 @@ def test_code_grounded_checkout_and_tool_isolation():
             "security: the Claude step NEVER receives FLEET_TOKEN",
             "FLEET_TOKEN" not in dumped,
         )
+        check(
+            "security: Claude action allows only the owner-gated Actions bot",
+            (claude.get("with") or {}).get("allowed_bots") == "github-actions[bot]",
+        )
+        check(
+            "security: Claude action does NOT allow arbitrary bots",
+            str((claude.get("with") or {}).get("allowed_bots", "")).strip() != "*",
+        )
         args = str((claude.get("with") or {}).get("claude_args", ""))
         check(
             "security: Claude is restricted to read-only exploration only",
@@ -331,19 +341,28 @@ def test_workflow_dispatch_uses_immutable_target_inputs():
     dh = read(".github", "workflows", "decision-handler.yml")
     doc = load_yaml(".github", "workflows", "deep-review.yml")
     steps = steps_of(doc, "deep-review")
+    on_doc = doc.get(True) or doc.get("on")
+    dispatch_inputs = on_doc["workflow_dispatch"]["inputs"]
 
     check(
-        "workflow: dispatch requires target repo input",
+        "workflow: dispatch accepts optional target repo input",
         "repo:" in dr and "Target repo name from the decision-card state" in dr,
     )
     check(
-        "workflow: dispatch requires target number input",
+        "workflow: dispatch accepts optional target number input",
         "number:" in dr
         and "Target PR or issue number from the decision-card state" in dr,
     )
     check(
-        "workflow: dispatch requires target kind input",
+        "workflow: dispatch accepts optional target kind input",
         "kind:" in dr and "Decision-card kind" in dr,
+    )
+    check(
+        "workflow: issue-only manual dispatch is supported",
+        dispatch_inputs["issue"].get("required") is True
+        and dispatch_inputs["repo"].get("required") is False
+        and dispatch_inputs["number"].get("required") is False
+        and dispatch_inputs["kind"].get("required") is False,
     )
     check(
         "workflow: dispatch accepts the captured head SHA",
@@ -357,25 +376,34 @@ def test_workflow_dispatch_uses_immutable_target_inputs():
         dispatch_arm = run.split("else", 1)[0]
         env = yaml.safe_dump(resolve.get("env", {}))
         check(
-            "workflow: dispatch resolve reads workflow inputs",
+            "workflow: complete dispatch resolve reads workflow inputs",
             all(
                 name in env
                 for name in (
+                    "INPUT_ISSUE",
                     "INPUT_REPO",
                     "INPUT_NUMBER",
                     "INPUT_KIND",
                     "INPUT_HEAD_SHA",
                 )
             )
-            and 'if [ "$EVENT_NAME" = "workflow_dispatch" ]' in run,
+            and 'if [ "$EVENT_NAME" = "workflow_dispatch" ] &&' in run
+            and '[ -n "$INPUT_REPO" ] &&' in run
+            and '[ -n "$INPUT_NUMBER" ] &&' in run
+            and '[ -n "$INPUT_KIND" ]; then' in run,
         )
         check(
-            "workflow: dispatch resolve does NOT re-read the mutable card body",
+            "workflow: complete dispatch does NOT re-read the mutable card body",
             "gh issue view" not in dispatch_arm
             and "python scripts/wheelhouse_core.py state" not in dispatch_arm,
         )
         check(
-            "workflow: manual label path is the state-block parse path",
+            "workflow: issue-only manual dispatch parses the current card",
+            'gh issue view "$INPUT_ISSUE" --json body --jq .body' in run
+            and "GH_TOKEN" in env,
+        )
+        check(
+            "workflow: manual label path is also a state-block parse path",
             "EVENT_ISSUE_BODY" in env
             and "python scripts/wheelhouse_core.py state repo" in run,
         )

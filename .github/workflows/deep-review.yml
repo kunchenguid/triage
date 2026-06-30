@@ -41,13 +41,13 @@ on:
         required: true
       repo:
         description: "Target repo name from the decision-card state"
-        required: true
+        required: false
       number:
         description: "Target PR or issue number from the decision-card state"
-        required: true
+        required: false
       kind:
         description: "Decision-card kind"
-        required: true
+        required: false
       head_sha:
         description: "Target PR head SHA from the decision-card state"
         required: false
@@ -137,22 +137,32 @@ jobs:
       - id: resolve
         if: steps.gate.outputs.enabled == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           EVENT_ISSUE_BODY: ${{ github.event.issue.body }}
+          INPUT_ISSUE: ${{ github.event.inputs.issue }}
           INPUT_REPO: ${{ github.event.inputs.repo }}
           INPUT_NUMBER: ${{ github.event.inputs.number }}
           INPUT_KIND: ${{ github.event.inputs.kind }}
           INPUT_HEAD_SHA: ${{ github.event.inputs.head_sha }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] &&
+             [ -n "$INPUT_REPO" ] &&
+             [ -n "$INPUT_NUMBER" ] &&
+             [ -n "$INPUT_KIND" ]; then
             repo="$INPUT_REPO"
             number="$INPUT_NUMBER"
             kind="$INPUT_KIND"
             head_sha="$INPUT_HEAD_SHA"
           else
-            export ISSUE_BODY="$EVENT_ISSUE_BODY"
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              ISSUE_BODY="$(gh issue view "$INPUT_ISSUE" --json body --jq .body)"
+            else
+              ISSUE_BODY="$EVENT_ISSUE_BODY"
+            fi
+            export ISSUE_BODY
             repo="$(python scripts/wheelhouse_core.py state repo)"
             number="$(python scripts/wheelhouse_core.py state number)"
             kind="$(python scripts/wheelhouse_core.py state kind)"
@@ -311,6 +321,12 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
+          # The Investigate checkbox owner-gates through decision-handler.yml,
+          # then dispatches this workflow with github.token. That makes the
+          # Claude action see github-actions[bot] as the actor and reject the
+          # run before it emits execution_file unless this exact bot is allowed.
+          # Keep this narrow: never use `*`, and never add external bot actors.
+          allowed_bots: github-actions[bot]
           prompt: ${{ steps.prepare.outputs.prompt }}
           claude_args: |
             --allowedTools Read,Grep,Glob
