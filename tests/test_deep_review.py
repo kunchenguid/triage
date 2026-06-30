@@ -37,6 +37,9 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import render_card as rc  # noqa: E402
 import wheelhouse_core as core  # noqa: E402
 
+CLAUDE_ACTION_PIN = (
+    "anthropics/claude-code-action@4633baf5267540f3f8cb58b684f79901d564c280"
+)
 _failures = []
 
 
@@ -168,6 +171,8 @@ def test_code_grounded_checkout_and_tool_isolation():
     check("workflow: a Claude step exists", claude is not None)
     if claude:
         dumped = yaml.safe_dump(claude)
+        check("workflow: Claude action is pinned to the reviewed v1 commit",
+              str(claude.get("uses", "")) == CLAUDE_ACTION_PIN)
         check("security: the Claude step NEVER receives FLEET_TOKEN",
               "FLEET_TOKEN" not in dumped)
         args = str((claude.get("with") or {}).get("claude_args", ""))
@@ -180,6 +185,8 @@ def test_code_grounded_checkout_and_tool_isolation():
 
     # The verdict is posted by the workflow (default token), not by Claude.
     dr = read(".github", "workflows", "deep-review.yml")
+    check("workflow: Claude action pin keeps the v1 breadcrumb",
+          f"uses: {CLAUDE_ACTION_PIN} # v1" in dr)
     post = next((s for s in steps if "post the verdict" in str(s.get("name", "")).lower()), None)
     check("workflow: verdict.md handoff is gone",
           "verdict.md" not in dr)

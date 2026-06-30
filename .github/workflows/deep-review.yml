@@ -303,12 +303,10 @@ jobs:
       # this repo's token (to operate in the workspace) - NEVER FLEET_TOKEN. It is
       # restricted to Read/Grep/Glob: it can explore the code, but it cannot write
       # files or execute the target's code.
-      #
-      # NOTE: pin a specific release of the action once you depend on it.
       - id: claude
         name: Claude deep review (code-grounded, read-only)
         if: steps.gate.outputs.enabled == 'true' && steps.verify_head.outputs.head_ok != 'false'
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@4633baf5267540f3f8cb58b684f79901d564c280 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
