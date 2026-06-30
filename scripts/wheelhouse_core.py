@@ -7,7 +7,9 @@ PR/issue with compliance + test status, classifies each deterministically, and
 emits a worklist of items that need the maintainer's decision. Also carries the
 security-gated CI approval (the fork-CI / pwn-request HOLD) and the scan-time
 auto-approval of provably-safe fork-CI runs (so only risky or uncertain ones
-raise a card).
+raise a card). The auto path logs exactly one stderr workflow-command line per
+CI-approval candidate it handles, so approve failures and fail-closed verdicts
+are visible in the scan-backstop run log.
 
 This is the GHA port of `data/triage/triage.py`. What the Actions model
 replaces has been dropped: the local single-flight lock (-> Actions
@@ -15,8 +17,8 @@ replaces has been dropped: the local single-flight lock (-> Actions
 state), per-repo `owner` (-> derived from github.repository_owner).
 
 Usage:
-  wheelhouse_core.py scan                 scan all configured repos -> JSON worklist; may auto-approve safe fork CI
-  wheelhouse_core.py scan <repo>          scan a single configured repo; may auto-approve safe fork CI
+  wheelhouse_core.py scan                 scan all configured repos -> JSON worklist; may auto-approve safe fork CI and log outcomes
+  wheelhouse_core.py scan <repo>          scan a single configured repo; may auto-approve safe fork CI and log outcomes
   wheelhouse_core.py approve-ci <repo> <pr>   security-gated fork-CI approval (exit 4 = HOLD)
   wheelhouse_core.py checks <repo>        list distinct check names on a repo's PRs (onboarding)
   wheelhouse_core.py authorized           print true/false: is $SENDER allowed to drive decisions?
@@ -305,6 +307,10 @@ def _display_list(values, limit=10):
     return "%s (+%d more; %d total)" % (", ".join(items[:limit]), len(items) - limit, len(items))
 
 
+def _workflow_command_text(value):
+    return re.sub(r"[\r\n]+", " ", str(value))
+
+
 def _non_default_base_posture(base_ref, default_branch):
     base = str(base_ref or "").strip()
     default = str(default_branch or "").strip()
@@ -344,28 +350,41 @@ def _ci_safety_note(verdict):
 def _auto_approve_or_card(owner, name, pr_number, posture, auto_enabled, changed_files=None):
     """For one `needs-ci-approval` PR, decide auto-approve vs card.
 
-    Returns (handled, note) where:
-      * handled=True  -> the run was auto-approved; emit NO card. `note` is the
-        audit line.
-      * handled=False -> raise a card; `note` is the safety warning to surface on
-        it (may be "").
+    Returns (handled, card_note, log_note) where:
+      * handled=True  -> the run was auto-approved; emit NO card. `card_note` is
+        unused (None) and `log_note` is the audit line for the scan-step
+        `::notice::`.
+      * handled=False -> raise a card; `card_note` is the safety warning to
+        surface on the card body (may be "", left EXACTLY as before), and
+        `log_note` is the per-PR outcome line for the scan-step `::warning::`.
+    `log_note` ALWAYS carries the `ci_safety` verdict `reason`, plus - when an
+    approve was attempted - the `approve_ci` `status` + `message`. That is what
+    makes a silent approve failure (`error`/`hold`/`noop`) impossible to hide in
+    the scan log; it is a logging string only (gh stderr/status text, never a
+    token) and does NOT change the card body.
     Fails CLOSED: any uncertainty (unsafe verdict, hold, approve error/exception)
     routes to a card so nothing is ever silently lost."""
     verdict = ci_safety("%s/%s" % (owner, name), str(pr_number), posture, changed_files)
+    reason = verdict.get("reason", "")
     if auto_enabled and verdict["safe"]:
         try:
             status, message = approve_ci(owner, name, str(pr_number), posture=posture, strict=True)
         except Exception as e:  # an approve that throws must fall back to a card
             status, message = ("error", "auto-approve raised: %s" % str(e)[:160])
         if status == "approved":
-            return (True, "auto-approved (%s): %s" % (verdict["reason"], message))
-        # hold / error -> fall through to a card (fail-closed), keeping the why.
-        note = "auto-approve did not complete (%s: %s)" % (status, message)
-        card_note = _ci_safety_note(verdict)
-        if card_note:
-            note += "; " + card_note
-        return (False, note)
-    return (False, _ci_safety_note(verdict))
+            return (True, None, "auto-approved (%s): %s" % (reason, message))
+        # hold / error / noop -> fall through to a card (fail-closed), keeping the why.
+        card_note = "auto-approve did not complete (%s: %s)" % (status, message)
+        safety_note = _ci_safety_note(verdict)
+        if safety_note:
+            card_note += "; " + safety_note
+        log_note = "verdict safe (%s); approve_ci %s: %s" % (reason, status, message)
+        return (False, card_note, log_note)
+    # Auto-approve disabled, or an unsafe verdict -> card; no approve attempted.
+    log_note = "verdict %s (%s); not auto-approved%s" % (
+        "safe" if verdict["safe"] else "unsafe", reason,
+        "" if auto_enabled else " (auto-approve disabled)")
+    return (False, _ci_safety_note(verdict), log_note)
 
 
 def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
@@ -375,8 +394,9 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
     defaulting True); a repo may override it per-repo. When enabled, a fork PR
     whose `ci_safety` verdict is provably safe is approved here (in the
     FLEET_TOKEN scan context) and emits NO card; everything risky/uncertain still
-    becomes a card. This runs only on the ok:true success path below, so an
-    ok:false repo (early return) is never auto-approved."""
+    becomes a card. Each handled ci-approval PR also emits exactly one stderr
+    notice/warning outcome line. This runs only on the ok:true success path
+    below, so an ok:false repo (early return) is never auto-approved."""
     name = repo_cfg["name"]
     slug = "%s/%s" % (owner, name)
     try:
@@ -438,13 +458,19 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
                 if default_posture is None:
                     default_posture = repo_pr_target_posture(slug)
                 posture = default_posture
-            handled, note = _auto_approve_or_card(owner, name, pr["number"], posture,
-                                                  auto_enabled, pr.get("changed_files"))
+            handled, card_note, log_note = _auto_approve_or_card(
+                owner, name, pr["number"], posture, auto_enabled, pr.get("changed_files"))
             if handled:
-                print("::notice::%s#%s %s" % (name, pr["number"], note), file=sys.stderr)
+                print("::notice::%s#%s %s"
+                      % (name, pr["number"], _workflow_command_text(log_note)), file=sys.stderr)
                 continue  # provably safe (or nothing to approve) -> NO card
-            if note:  # surface the safety warning on the card body / response
-                item["warning"] = note
+            # Carded: log exactly one per-PR outcome line so a silent approve
+            # failure (the inert-in-production failure mode) can never hide in the
+            # scan log again. The card body itself is unchanged.
+            print("::warning::wheelhouse auto-approve carded %s#%s: %s"
+                  % (name, pr["number"], _workflow_command_text(log_note)), file=sys.stderr)
+            if card_note:  # surface the safety warning on the card body / response
+                item["warning"] = card_note
 
         items.append(item)
 

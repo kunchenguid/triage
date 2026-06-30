@@ -20,6 +20,9 @@ These tests cover:
     raises NO card, a risky/posture/error PR still raises a card (with a
     warning), an approve failure or exception falls back to a card, and an
     ok:false repo is never auto-approved;
+  * the scan-log observability contract: each auto-path CI-approval candidate
+    emits one notice when approved or one warning when carded, with the verdict
+    reason and any approve status/message;
   * idempotency by construction (a PR no longer `needs-ci-approval` is never
     re-approved), default-on, explicit opt-out, and the per-repo override.
 """
@@ -347,11 +350,13 @@ def run_build_repo(pr_nodes, *, auto_approve_ci=True, repo_over=None, posture_va
     save = (core.gh_graphql, core.repo_pr_target_posture, core.ci_safety, core.approve_ci)
     core.gh_graphql, core.repo_pr_target_posture = fake_graphql, fake_posture
     core.ci_safety, core.approve_ci = fake_ci_safety, fake_approve
+    err = io.StringIO()
     try:
-        with redirect_stderr(io.StringIO()):
+        with redirect_stderr(err):
             result, items = core.build_repo("owner", repo_cfg, False, auto_approve_ci=auto_approve_ci)
     finally:
         core.gh_graphql, core.repo_pr_target_posture, core.ci_safety, core.approve_ci = save
+    calls["stderr"] = err.getvalue()  # so logging-path tests can assert the per-PR line
     return result, items, calls
 
 
@@ -490,6 +495,96 @@ def test_approve_exception_falls_back_to_card():
     result, items, calls = run_build_repo([needs_ci_pr()], approve_raises=True)
     check("route: an approve that raises falls back to a card", len(items) == 1)
     check("route: approve was attempted", len(calls["approve"]) == 1)
+
+
+# --------------------------------------------------------------------------- #
+# observability: every ci-approval PR the auto path handles emits ONE log line
+# (a ::notice:: when approved, a ::warning:: with the verdict reason + any
+# approve_ci status/message when carded) so a silent approve failure - the
+# "inert in production, approved 0 runs" bug - can never hide in the scan log.
+# --------------------------------------------------------------------------- #
+def test_auto_approved_pr_emits_one_notice():
+    result, items, calls = run_build_repo([needs_ci_pr()])
+    err = calls["stderr"]
+    check("log: approved PR emits a ::notice::", "::notice::demo#1" in err)
+    check("log: approved notice carries the verdict reason", "clean" in err)
+    check("log: approved notice carries the approve message", "approved 1 run" in err)
+    check("log: approved PR emits NO ::warning::", "::warning::" not in err)
+
+
+def test_carded_approve_error_is_logged_with_status_and_message():
+    # The production failure mode: verdict is safe, but the approve POST fails -
+    # previously swallowed into item["warning"], now LOUD in the scan log.
+    result, items, calls = run_build_repo([needs_ci_pr()],
+                                          approve_result=("error", "api fail: 403 forbidden"))
+    err = calls["stderr"]
+    check("log: carded PR emits a ::warning::", "::warning::wheelhouse auto-approve carded demo#1:" in err)
+    check("log: carded warning carries the verdict reason", "verdict safe (clean)" in err)
+    check("log: carded warning surfaces approve_ci status", "approve_ci error" in err)
+    check("log: carded warning surfaces approve_ci message", "api fail: 403 forbidden" in err)
+    check("log: carded PR still raises a card", len(items) == 1)
+    check("log: card body warning is unchanged (no verdict-reason leak)",
+          "auto-approve did not complete (error: api fail: 403 forbidden)" == (items[0].get("warning") or ""))
+
+
+def test_carded_approve_multiline_error_is_logged_on_one_line():
+    message = "api fail: first line\nsecond line\r\nthird line\rfourth line"
+    result, items, calls = run_build_repo([needs_ci_pr()],
+                                          approve_result=("error", message))
+    err = calls["stderr"]
+    lines = err.splitlines()
+    check("log: multiline approve error emits one physical warning line", len(lines) == 1)
+    check("log: multiline approve error is collapsed in workflow command",
+          "api fail: first line second line third line fourth line" in err)
+    check("log: multiline approve error does not leave continuation text",
+          all(line.startswith("::warning::") for line in lines))
+    check("log: card body still carries the original multiline warning",
+          ("auto-approve did not complete (error: %s)" % message) == (items[0].get("warning") or ""))
+
+
+def test_auto_approved_multiline_message_is_logged_on_one_line():
+    result, items, calls = run_build_repo([needs_ci_pr()],
+                                          approve_result=("approved", "approved\nrun"))
+    err = calls["stderr"]
+    lines = err.splitlines()
+    check("log: multiline approve success emits one physical notice line", len(lines) == 1)
+    check("log: multiline approve success is collapsed in workflow command", "approved run" in err)
+
+
+def test_carded_approve_noop_is_logged_with_status():
+    result, items, calls = run_build_repo([needs_ci_pr()],
+                                          approve_result=("noop", "no matching runs"))
+    err = calls["stderr"]
+    check("log: noop carded warning names the noop status", "approve_ci noop" in err)
+    check("log: noop carded warning surfaces the message", "no matching runs" in err)
+    check("log: noop carded warning still carries the verdict reason", "verdict safe (clean)" in err)
+
+
+def test_carded_approve_exception_is_logged():
+    result, items, calls = run_build_repo([needs_ci_pr()], approve_raises=True)
+    err = calls["stderr"]
+    check("log: an approve that raises is logged as an error outcome", "approve_ci error" in err)
+    check("log: the raised-approve warning mentions it was raised", "auto-approve raised" in err)
+
+
+def test_carded_unsafe_verdict_is_logged_without_approve_status():
+    # No approve was attempted, so the log line carries the verdict reason only.
+    verdict = {"safe": False, "error": False, "risky_files": [".github/workflows/ci.yml"],
+               "pr_target": False, "exploit": False, "reason": "touches CI-execution files"}
+    result, items, calls = run_build_repo([needs_ci_pr()], verdict=verdict)
+    err = calls["stderr"]
+    check("log: unsafe-verdict PR emits a ::warning::", "::warning::wheelhouse auto-approve carded demo#1:" in err)
+    check("log: unsafe-verdict warning marks the verdict unsafe", "verdict unsafe (touches CI-execution files)" in err)
+    check("log: unsafe-verdict warning has no approve_ci status (none attempted)", "approve_ci" not in err)
+
+
+def test_carded_disabled_auto_approve_is_logged():
+    result, items, calls = run_build_repo([needs_ci_pr()], auto_approve_ci=False)
+    err = calls["stderr"]
+    check("log: disabled auto-approve still emits a per-PR ::warning::",
+          "::warning::wheelhouse auto-approve carded demo#1:" in err)
+    check("log: disabled auto-approve line says so", "auto-approve disabled" in err)
+    check("log: disabled auto-approve attempted no approve", calls["approve"] == [])
 
 
 def run_approve_ci(run_list_result, approval_results=None, run_details=None,
@@ -822,6 +917,14 @@ def main():
     test_approve_noop_falls_back_to_card()
     test_approve_hold_falls_back_to_card()
     test_approve_exception_falls_back_to_card()
+    test_auto_approved_pr_emits_one_notice()
+    test_carded_approve_error_is_logged_with_status_and_message()
+    test_carded_approve_multiline_error_is_logged_on_one_line()
+    test_auto_approved_multiline_message_is_logged_on_one_line()
+    test_carded_approve_noop_is_logged_with_status()
+    test_carded_approve_exception_is_logged()
+    test_carded_unsafe_verdict_is_logged_without_approve_status()
+    test_carded_disabled_auto_approve_is_logged()
     test_approve_ci_run_list_failure_returns_error()
     test_approve_ci_invalid_run_list_returns_error()
     test_approve_ci_any_failed_post_returns_error()

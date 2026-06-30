@@ -66,6 +66,7 @@ auto_approve_ci: true  # auto-approve provably-safe fork-CI runs (DEFAULT ON; se
 
 > **Heads-up - `auto_approve_ci` defaults ON.**
 > When this key is absent it is treated as `true`, so a fresh fork auto-approves fork-CI runs that the security gate proves safe (no CI-file changes, the PR targets the repo default branch, no `pull_request_target` workflow, and all safety reads and approvals succeed) and only raises a card for risky or uncertain runs.
+> The scan log records every CI-approval candidate the auto path handles: approved runs emit one `::notice::`, and carded runs emit one `::warning::wheelhouse auto-approve carded <repo>#<pr>: ...` line with the safety verdict reason and any approval status/message.
 > Set it to `false` to opt out (every awaiting run raises a card, as you click to approve each), or add `auto_approve_ci: false` to a single `repos:` entry to opt that one repo out.
 > See [Security notes](#security-notes).
 
@@ -147,6 +148,7 @@ If you act before that refresh lands, a `/merge` (or a "merge it" comment) still
 The scheduled backstop also self-heals: if the underlying PR/issue gets merged or closed elsewhere, its card is closed automatically on the next scan.
 If an open target no longer needs a maintainer decision, its pure pending card is closed too.
 By default the scan also **auto-approves fork-CI runs it proves safe** (`auto_approve_ci`, on unless you opt out), so an *Approve the CI run* card now appears only for risky or uncertain cases - a run that changes CI/action files, targets a non-default base branch, has unreadable safety state, hits an approval error, or whose repo has a `pull_request_target` workflow (see [Security notes](#security-notes)).
+Each CI-approval candidate the auto path handles also writes exactly one scan-log line, so approval failures and fail-closed safety reasons are visible in `scan-backstop`.
 
 ## Security notes
 
@@ -156,7 +158,8 @@ By default the scan also **auto-approves fork-CI runs it proves safe** (`auto_ap
 - **Auto-approve of provably-safe fork CI (`auto_approve_ci`, DEFAULT ON).** To kill the repetitive "approve CI" clicks, the scan applies the *same* security gate *before* surfacing a card and auto-approves the runs it proves safe - so only risky or uncertain ones still raise a card.
   Auto-approve is a strict **subset** of the manual gate: a run is auto-cleared only when there are **no** CI-execution file changes (above), the PR targets the repo default branch, the target repo's default branch runs **no** `pull_request_target` workflow, and all safety reads and approval calls succeed.
   Every uncertainty fails closed to a card (unreadable PR files, a non-default PR base branch, unreadable workflows, or an approve error).
-  It runs in the cross-repo `FLEET_TOKEN` scan step and never writes a card; nothing is ever silently approved or dropped.
+  It runs in the cross-repo `FLEET_TOKEN` scan step; every approved run logs a `::notice::`, and every carded run logs a `::warning::wheelhouse auto-approve carded <repo>#<pr>: ...` line with the `ci_safety` reason and, when an approval was attempted, the `approve_ci` status/message.
+  Those log lines are status text only, not token values, and they do not change the approve/card decision or the card body warning.
   Set `auto_approve_ci: false` (globally or per repo) to disable it.
   - **The `pull_request_target` caveat (stated plainly).**
     This approval gates the fork's read-only `pull_request` CI run.
@@ -180,6 +183,9 @@ By default the scan also **auto-approves fork-CI runs it proves safe** (`auto_ap
 - **A decision didn't execute.**
   Almost always `FLEET_TOKEN` scope: it needs Actions + Contents + Issues + Pull requests (read & write) on the **target** repo. The card stays open with an error comment when an action fails.
   A `/merge` that's refused with a "head moved" note is working as intended - re-scan and decide again.
+- **Approve-CI cards appear for PRs that look safe.**
+  Open the latest `scan-backstop` run logs and search for `wheelhouse auto-approve carded`.
+  The line names the repo and PR, includes the `ci_safety` verdict reason, and includes the `approve_ci` status/message when Wheelhouse tried to approve but had to fail closed.
 - **Cron lag.**
   The scheduled keep-current path runs hourly, but GitHub cron is best-effort and can be delayed.
   For lower-latency items, wire the dispatch path from [`docs/ONBOARDING.md`](docs/ONBOARDING.md); dispatches nudge the same card-refresh logic immediately.
@@ -202,7 +208,7 @@ wheelhouse.config.yml          the one file you edit
   deep-review.yml              always-on, code-grounded: Investigate box / label -> check out the target read-only -> Claude posts a verdict
   no-mistakes-required.yml     PR-to-main gate requiring the no-mistakes signature
 scripts/
-  wheelhouse_core.py           GraphQL scan, classify, dedup/overlap, CI safety + auto-approval
+  wheelhouse_core.py           GraphQL scan, classify, dedup/overlap, CI safety, auto-approval, and scan logs
   render_card.py               build the decision card; create/refresh/close cards in this repo
   apply_decision.py            parse a tick/slash/label/plain-English comment, execute it on the target repo
   build_item.py                normalize a dispatch payload into a card item
@@ -210,7 +216,7 @@ scripts/
 tests/test_decision.py         offline unit test for the parse/route logic (mocks the LLM), incl. investigate routing
 tests/test_card_refresh.py     offline unit test for refresh change detection, guards, and labels
 tests/test_reconcile.py        offline unit test for reconcile routing and self-healing
-tests/test_ci_autoapprove.py   offline unit test for CI safety and scan-time auto-approval
+tests/test_ci_autoapprove.py   offline unit test for CI safety, scan-time auto-approval, and logging
 tests/test_deep_review.py      offline unit test for the always-on deep-review + Investigate wiring
 docs/ONBOARDING.md             how to wire a source repo's dispatch (the fast path)
 ```

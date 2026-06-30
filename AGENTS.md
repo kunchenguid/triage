@@ -225,6 +225,19 @@ still appears where it's plain English, e.g. "triage the queue".)
   `ci-approval` card exactly as before, carrying the safety warning. **Fail closed
   everywhere**: an unsafe verdict, a `hold`/`error` from the approve, or an
   approve that throws all fall back to a card - nothing is silently dropped.
+  **Observability (every outcome is logged, never silent).** `_auto_approve_or_card`
+  returns `(handled, card_note, log_note)` and `build_repo` emits exactly ONE
+  stderr line per `needs-ci-approval` PR the auto path handles: a `::notice::`
+  when approved, else a `::warning::wheelhouse auto-approve carded <repo>#<pr>:
+  <log_note>`. The `log_note` always carries the `ci_safety` verdict `reason`
+  and, when an approve was attempted, the `approve_ci` `status` + `message`
+  (e.g. `error: <gh stderr>`, `hold`, `noop`), so a real approve failure that
+  used to be swallowed into the card body is now visible in the scan-step log -
+  the next `scan-backstop` run shows exactly why each safe-looking PR was not
+  approved. This is logging only: it never changes the verdict, the approve/card
+  decision, token usage, or fail-closed behavior, the `card_note` going into
+  `item["warning"]` is unchanged, and the line is gh stderr/status text, never a
+  secret value.
   Idempotent by construction: once approved the next scan sees CI running/results
   (not `needs-ci-approval`), so it is not re-approved; a later push that adds a
   workflow file or flips the posture routes the PR back to a card. The auto path
@@ -294,8 +307,7 @@ now also the non-consuming investigate routing / allow-set / `clear_checkbox`,
 refreshability-guard / label-replace logic, pure functions, no network,
 `python tests/test_reconcile.py` - reconcile routing and stale-card self-healing,
 no network, `python tests/test_ci_autoapprove.py` - the shared `ci_safety`
-verdict, `pull_request_target` posture detection, and the auto-approve-vs-card
-routing in `build_repo`, all with the network-touching helpers stubbed, and
+verdict, `pull_request_target` posture detection, and the auto-approve-vs-card routing plus scan-log observability in `build_repo`, all with the network-touching helpers stubbed, and
 `python tests/test_deep_review.py` - the always-on/code-grounded deep-review +
 Investigate wiring: render options, the removed enable flag, the token-absent
 note, the `persist-credentials: false` checkout + read-only tool isolation, and

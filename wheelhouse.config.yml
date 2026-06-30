@@ -103,7 +103,9 @@ card_issues: false
 #     action.yml/.yaml) is NEVER auto-approved (the pwn-request HOLD), and
 #   * a repo whose base branch runs a `pull_request_target` workflow is never
 #     auto-cleared either - its CI-approval still raises a card (with a warning).
-# Everything uncertain fails closed to a card; nothing is silently approved.
+# Everything uncertain fails closed to a card. The scan-backstop log records one
+# notice or warning for every auto-approve path outcome, including approval
+# failures that route back to a card.
 # Caveat: this gates the fork `pull_request` run only. A `pull_request_target`
 # workflow runs automatically with repo secrets and is NOT gated by any approval,
 # so the posture check is a "don't silently auto-clear + warn me" signal plus a
