@@ -65,6 +65,9 @@ def pr_node(number, author=None, status_rollup=MISSING, cross_repo=False):
     }
     if cross_repo is False:
         node["headRepository"] = {"name": "demo", "owner": {"login": "owner"}}
+    elif cross_repo == "missing":
+        node.pop("isCrossRepository")
+        node.pop("headRepository")
     return node
 
 
@@ -98,6 +101,7 @@ def run_build_repo(
     *,
     card_issues=False,
     approve_result=("error", "api fail"),
+    ci_safety_result=None,
 ):
     calls = {"approve": []}
     repo_cfg = {
@@ -138,7 +142,7 @@ def run_build_repo(
         "exploit": False,
         "error": False,
     }
-    core.ci_safety = lambda slug, pr, posture, changed_files=None: {
+    safe_verdict = {
         "safe": True,
         "error": False,
         "risky_files": [],
@@ -146,11 +150,15 @@ def run_build_repo(
         "exploit": False,
         "reason": "clean",
     }
+    core.ci_safety = lambda slug, pr, posture, changed_files=None: (
+        safe_verdict if ci_safety_result is None else ci_safety_result
+    )
     core.approve_ci = fake_approve
     os.environ["OWNER"] = "owner"
     os.environ["GITHUB_REPOSITORY_OWNER"] = "owner"
+    err = io.StringIO()
     try:
-        with redirect_stderr(io.StringIO()):
+        with redirect_stderr(err):
             result, items = core.build_repo(
                 "owner", repo_cfg, card_issues, auto_approve_ci=True
             )
@@ -172,6 +180,7 @@ def run_build_repo(
             os.environ.pop("GITHUB_REPOSITORY_OWNER", None)
         else:
             os.environ["GITHUB_REPOSITORY_OWNER"] = old_repo_owner
+    calls["stderr"] = err.getvalue()
     return result, items, calls
 
 
@@ -206,18 +215,88 @@ def test_pr_author_filter_skips_owner_maintainer_and_bots():
     check("author-filter: non-CI PRs do not invoke approve_ci", calls["approve"] == [])
 
 
-def test_ci_approval_author_filter_runs_before_auto_approve():
+def test_ci_approval_author_filter_preserves_safe_auto_approve():
     prs = [
         needs_ci_pr(10, OWNER),
         needs_ci_pr(11, BOT_TYPE),
         needs_ci_pr(12, HUMAN),
     ]
-    result, items, calls = run_build_repo(prs)
+    result, items, calls = run_build_repo(prs, approve_result=("approved", "ok"))
     numbers = [it["number"] for it in items]
     check("author-filter: owner ci-approval PR skipped", 10 not in numbers)
     check("author-filter: bot ci-approval PR skipped", 11 not in numbers)
-    check("author-filter: human ci-approval PR still carded", numbers == [12])
-    check("author-filter: approve_ci only considered the human PR", calls["approve"] == ["12"])
+    check("author-filter: approved human ci-approval PR skipped", 12 not in numbers)
+    check(
+        "author-filter: approve_ci considered every safe ci-approval PR",
+        calls["approve"] == ["10", "11", "12"],
+    )
+    check(
+        "author-filter: safe approvals still emit notices",
+        calls["stderr"].count("::notice::demo#") == 3,
+    )
+
+
+def test_ci_approval_author_filter_suppresses_cards_after_approve_failure():
+    prs = [
+        needs_ci_pr(20, OWNER),
+        needs_ci_pr(21, BOT_TYPE),
+        needs_ci_pr(22, HUMAN),
+    ]
+    result, items, calls = run_build_repo(prs)
+    numbers = [it["number"] for it in items]
+    check("author-filter: failed owner ci-approval card suppressed", 20 not in numbers)
+    check("author-filter: failed bot ci-approval card suppressed", 21 not in numbers)
+    check("author-filter: failed human ci-approval PR still carded", numbers == [22])
+    check(
+        "author-filter: approve_ci still attempted excluded safe PRs",
+        calls["approve"] == ["20", "21", "22"],
+    )
+    check(
+        "author-filter: excluded approve failures still log warnings",
+        "suppressed-card demo#20" in calls["stderr"]
+        and "suppressed-card demo#21" in calls["stderr"],
+    )
+    check(
+        "author-filter: human approve failure keeps carded log",
+        "auto-approve carded demo#22" in calls["stderr"],
+    )
+
+
+def test_ci_approval_author_filter_suppresses_unsafe_cards_without_approve():
+    risky = {
+        "safe": False,
+        "error": False,
+        "risky_files": [".github/workflows/ci.yml"],
+        "pr_target": False,
+        "exploit": False,
+        "reason": "risky",
+    }
+    prs = [needs_ci_pr(30, OWNER), needs_ci_pr(31, HUMAN)]
+    result, items, calls = run_build_repo(prs, ci_safety_result=risky)
+    numbers = [it["number"] for it in items]
+    check("author-filter: risky owner ci-approval card suppressed", 30 not in numbers)
+    check("author-filter: risky human ci-approval PR still carded", numbers == [31])
+    check("author-filter: risky PRs do not invoke approve_ci", calls["approve"] == [])
+    check(
+        "author-filter: suppressed risky PR still logs warning",
+        "suppressed-card demo#30" in calls["stderr"],
+    )
+
+
+def test_ci_approval_author_filter_suppresses_unknown_fork_cards():
+    prs = [
+        pr_node(40, author=OWNER, status_rollup=None, cross_repo="missing"),
+        pr_node(41, author=HUMAN, status_rollup=None, cross_repo="missing"),
+    ]
+    result, items, calls = run_build_repo(prs)
+    numbers = [it["number"] for it in items]
+    check("author-filter: unknown-fork owner card suppressed", 40 not in numbers)
+    check("author-filter: unknown-fork human PR still carded", numbers == [41])
+    check("author-filter: unknown fork status still skips approve_ci", calls["approve"] == [])
+    check(
+        "author-filter: suppressed unknown fork still logs warning",
+        "suppressed-card demo#40" in calls["stderr"],
+    )
 
 
 def test_issue_author_filter_matches_pr_filter():
@@ -245,7 +324,10 @@ def test_issue_author_filter_matches_pr_filter():
 
 def main():
     test_pr_author_filter_skips_owner_maintainer_and_bots()
-    test_ci_approval_author_filter_runs_before_auto_approve()
+    test_ci_approval_author_filter_preserves_safe_auto_approve()
+    test_ci_approval_author_filter_suppresses_cards_after_approve_failure()
+    test_ci_approval_author_filter_suppresses_unsafe_cards_without_approve()
+    test_ci_approval_author_filter_suppresses_unknown_fork_cards()
     test_issue_author_filter_matches_pr_filter()
     print()
     if _failures:

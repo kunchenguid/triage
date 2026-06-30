@@ -614,11 +614,12 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
 
     items = []
     for pr in enriched:
-        if pr["author_excluded"]:
-            continue
         if pr["bucket"] not in NEEDS_MAINTAINER:
             continue
         kind = PR_KIND[pr["bucket"]]
+        author_excluded = pr["author_excluded"]
+        if author_excluded and kind != "ci-approval":
+            continue
         overlap = _overlap_note(pr["number"], pr["closes"], closing, addressed)
         priority = "high" if overlap else PRIORITY.get(pr["bucket"], "low")
         summary = "compliance=%s tests=%s" % (pr["comp"], pr["tests"])
@@ -642,16 +643,24 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
 
         if kind == "ci-approval":
             if pr.get("cross_repo") is not True:
-                item["warning"] = (
+                card_note = (
                     "Wheelhouse could not determine whether this PR is from a "
                     "fork, so it is leaving fork-CI approval for manual review "
                     "instead of auto-approving or consuming the card."
                 )
                 print(
-                    "::warning::wheelhouse auto-approve carded %s#%s: "
-                    "fork status unknown; not auto-approved" % (name, pr["number"]),
+                    "::warning::wheelhouse auto-approve %s %s#%s: "
+                    "fork status unknown; not auto-approved"
+                    % (
+                        "suppressed-card" if author_excluded else "carded",
+                        name,
+                        pr["number"],
+                    ),
                     file=sys.stderr,
                 )
+                if author_excluded:
+                    continue
+                item["warning"] = card_note
                 items.append(item)
                 continue
             posture = _non_default_base_posture(pr.get("base_ref"), default_branch)
@@ -674,14 +683,21 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
                     file=sys.stderr,
                 )
                 continue  # provably safe (or nothing to approve) -> NO card
-            # Carded: log exactly one per-PR outcome line so a silent approve
-            # failure (the inert-in-production failure mode) can never hide in the
-            # scan log again. The card body itself is unchanged.
+            # Log exactly one per-PR outcome line so a silent approve failure
+            # can never hide in the scan log. The card body itself is unchanged
+            # when one is emitted.
             print(
-                "::warning::wheelhouse auto-approve carded %s#%s: %s"
-                % (name, pr["number"], _workflow_command_text(log_note)),
+                "::warning::wheelhouse auto-approve %s %s#%s: %s"
+                % (
+                    "suppressed-card" if author_excluded else "carded",
+                    name,
+                    pr["number"],
+                    _workflow_command_text(log_note),
+                ),
                 file=sys.stderr,
             )
+            if author_excluded:
+                continue
             if card_note:  # surface the safety warning on the card body / response
                 item["warning"] = card_note
 
