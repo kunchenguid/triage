@@ -277,19 +277,13 @@ API key) and the same injection model (only owner-authored text is an
 instruction; target content is delimited untrusted data; the LLM gets only this
 repo's token, never `FLEET_TOKEN`):
 
-- **`deep-review.yml` - ALWAYS-ON, code-grounded (no enable flag).** Triggered by
-  ticking the **Investigate** box on a card or applying the `needs-deep-review`
-  label. It checks out the TARGET's code read-only (`FLEET_TOKEN`,
-  `persist-credentials: false`, the PR head for a review card / the default branch
-  for an issue card) and runs Claude restricted to `--allowedTools
-  Read,Grep,Glob,Write` over that checkout - so it traces real code paths, never
-  just the diff, and can NEVER execute the target's code (no Bash, no build/test).
-  Claude writes `verdict.md`; the workflow posts it as a card comment with
-  `github.token`. The ONLY gate is `CLAUDE_CODE_OAUTH_TOKEN`: when it is ABSENT the
-  workflow posts a one-line "Deep-review needs CLAUDE_CODE_OAUTH_TOKEN configured
-  to run." note instead of silently no-opping. (Manual triggering means there is
-  no runaway-cost reason for a config flag, so the old `deep_review` flag was
-  removed entirely - config, `load_config`, and the `deep-review-enabled` CLI.)
+- **`deep-review.yml` - ALWAYS-ON, code-grounded (no enable flag).** Triggered by ticking the **Investigate** box on a card or applying the `needs-deep-review` label.
+  It checks out the TARGET's code read-only (`FLEET_TOKEN`, `persist-credentials: false`, the PR head for a review card / the default branch for an issue card) and runs Claude restricted to `--allowedTools Read,Grep,Glob` over that checkout - so it traces real code paths, never just the diff, and can NEVER write files or execute the target's code (no Bash, no build/test).
+  Claude does not write a verdict file.
+  Its final response is captured from the action's `execution_file` output by preferring the clean `type: "result"` event's `result` string, falling back to the last assistant text, and the trusted workflow step posts that text as a card comment with `github.token`.
+  If no usable output is present, the workflow posts "Deep review ran but produced no verdict (see the workflow run logs)." and fails the run.
+  The ONLY gate is `CLAUDE_CODE_OAUTH_TOKEN`: when it is ABSENT the workflow posts a one-line "Deep-review needs CLAUDE_CODE_OAUTH_TOKEN configured to run." note instead of silently no-opping.
+  Manual triggering means there is no runaway-cost reason for a config flag, so the old `deep_review` flag was removed entirely - config, `load_config`, and the `deep-review-enabled` CLI.
 - **`nl_decisions`** in `decision-handler.yml`: a plain-English owner comment is
   mapped to a structured intent (see Sharp edges). Opt-in: inert unless
   `nl_decisions: true` AND `CLAUDE_CODE_OAUTH_TOKEN` present. Claude is restricted

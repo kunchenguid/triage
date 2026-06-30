@@ -17,8 +17,9 @@ so these tests pin the *wiring* instead:
     than silently no-opping;
   * code-grounded + security: deep-review.yml checks out the target with
     FLEET_TOKEN and `persist-credentials: false`, runs Claude restricted to
-    read-only exploration tools (Read/Grep/Glob/Write), and the Claude step never
-    receives FLEET_TOKEN; the verdict is posted with the default token;
+    read-only exploration tools (Read/Grep/Glob), and the Claude step never
+    receives FLEET_TOKEN; the trusted post step captures the action's final
+    output from `execution_file` and posts it with the default token;
   * prompt boundary: the mutable decision card, target diff/issue text, and
     target code are all presented as delimited untrusted data;
   * investigate trigger: decision-handler.yml keeps `actions: write` only on an
@@ -170,16 +171,41 @@ def test_code_grounded_checkout_and_tool_isolation():
         check("security: the Claude step NEVER receives FLEET_TOKEN",
               "FLEET_TOKEN" not in dumped)
         args = str((claude.get("with") or {}).get("claude_args", ""))
-        check("security: Claude is restricted to read-only exploration + Write",
+        check("security: Claude is restricted to read-only exploration only",
               "--allowedTools" in args
-              and all(t in args for t in ("Read", "Grep", "Glob", "Write")))
+              and "Read,Grep,Glob" in args
+              and "Write" not in args)
         check("security: Claude is NOT granted Bash / shell execution",
               "Bash" not in args)
 
     # The verdict is posted by the workflow (default token), not by Claude.
     dr = read(".github", "workflows", "deep-review.yml")
-    check("workflow: verdict posted from verdict.md with the default token",
-          "verdict.md" in dr and "github.token" in dr)
+    post = next((s for s in steps if "post the verdict" in str(s.get("name", "")).lower()), None)
+    check("workflow: verdict.md handoff is gone",
+          "verdict.md" not in dr)
+    check("workflow: a trusted post step exists",
+          post is not None)
+    if post:
+        env = yaml.safe_dump(post.get("env", {}))
+        run = str(post.get("run", ""))
+        check("workflow: post step uses the default token",
+              "github.token" in env and "FLEET_TOKEN" not in yaml.safe_dump(post))
+        check("workflow: post step captures the Claude action execution_file output",
+              "EXECUTION_FILE" in env and "steps.claude.outputs.execution_file" in env)
+        check("workflow: post step extracts the clean final result event",
+              'event.get("type") == "result"' in run
+              and 'event.get("result")' in run
+              and 'not event.get("is_error")' in run)
+        check("workflow: post step can fall back to last assistant text",
+              'event.get("type") == "assistant"' in run
+              and 'item.get("type") == "text"' in run)
+        check("workflow: no-output fallback still posts and fails clearly",
+              "Deep review ran but produced no verdict (see the workflow run logs)." in run
+              and "json.JSONDecodeError" in run
+              and "failed = True" in run
+              and "sys.exit(1)" in run)
+        check("workflow: trusted post step comments via gh, not Claude",
+              '["gh", "issue", "comment"' in run)
 
 
 def test_prompt_treats_card_body_as_untrusted_data():
@@ -244,6 +270,9 @@ def test_workflow_dispatch_uses_immutable_target_inputs():
         check("workflow: head verification compares checkout HEAD to captured SHA",
               "git -C target-src rev-parse HEAD" in str(verify.get("run", ""))
               and "steps.resolve.outputs.head_sha" in yaml.safe_dump(verify))
+        check("workflow: head mismatch is carried by step output, not verdict.md",
+              "head_ok=false" in str(verify.get("run", ""))
+              and "verdict.md" not in str(verify.get("run", "")))
 
     check("handler: handle exposes the parsed target repo",
           "target_repo: ${{ steps.decide.outputs.target_repo }}" in dh)
