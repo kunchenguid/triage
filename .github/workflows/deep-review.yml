@@ -6,8 +6,9 @@ name: deep-review
 #   * tick the "Investigate" box on a pr-review / issue-triage card
 #     (decision-handler.yml dispatches this workflow, non-consuming), or
 #   * apply the `needs-deep-review` label to a card by hand.
-# Either way this workflow checks out the TARGET repo's code read-only and runs
-# Claude over it to post a merit / triage verdict as a card comment.
+# Either way this workflow checks out the TARGET repo's code read-only, runs
+# Claude over it, captures Claude's final response from the action output, and
+# posts that merit / triage verdict as a card comment.
 #
 # There is NO enable flag. The only thing it needs is the CLAUDE_CODE_OAUTH_TOKEN
 # secret (a Claude *subscription* token from `claude setup-token`, NOT an

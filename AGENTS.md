@@ -305,9 +305,9 @@ no network, `python tests/test_ci_autoapprove.py` - the shared `ci_safety`
 verdict, `pull_request_target` posture detection, and the auto-approve-vs-card routing plus scan-log observability in `build_repo`, all with the network-touching helpers stubbed, and
 `python tests/test_deep_review.py` - the always-on/code-grounded deep-review +
 Investigate wiring: render options, the removed enable flag, the token-absent
-note, the `persist-credentials: false` checkout + read-only tool isolation, and
-the handler's `workflow_dispatch` trigger, all by inspecting the scripts/YAML, no
-network), and
+note, the `persist-credentials: false` checkout + read-only tool isolation, the
+action-output verdict capture, and the handler's `workflow_dispatch` trigger,
+all by inspecting the scripts/YAML, no network), and
 YAML-parse `.github/workflows/*.yml` + `wheelhouse.config.yml` +
 `.github/ISSUE_TEMPLATE/*.yml` (run `actionlint` if available; fetch the binary
 via its `download-actionlint.bash` if not). The live LLM paths (deep-review,
