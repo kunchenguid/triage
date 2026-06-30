@@ -69,7 +69,8 @@ auto_approve_ci: true  # auto-approve provably-safe fork-CI runs (DEFAULT ON; se
 > A run is approved only after Wheelhouse verifies it is the target PR's awaiting `action_required` run: GitHub-populated `workflow_run.pull_requests` must contain exactly that PR, and fork-originated empty associations must match the PR `head_sha` plus `head_branch`.
 > If the approval call verifies that no matching run is awaiting approval, the scan emits no card and the backstop consumes any stale CI-approval card.
 > The scan log records every CI-approval candidate it handles: approved runs and verified no-pending runs emit one `::notice::`, while carded runs emit one `::warning::wheelhouse auto-approve carded <repo>#<pr>: ...` line with the safety or uncertainty reason and any approval status/message.
-> Set it to `false` to opt out (every fork-CI candidate raises a card, as you click to approve each), or add `auto_approve_ci: false` to a single `repos:` entry to opt that one repo out.
+> Set it to `false` to opt out for contributor PRs (every contributor fork-CI candidate raises a card, as you click to approve each), or add `auto_approve_ci: false` to a single `repos:` entry to opt that one repo out.
+> Owner, maintainer, and bot-authored fork PRs are excluded from the decision queue, so Wheelhouse still runs the safety-gated approve/noop path for safe CI and suppresses their cards.
 > See [Security notes](#security-notes).
 
 Not sure what your check names are?
@@ -176,7 +177,7 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
   Every uncertainty fails closed to a card (unknown fork status, unreadable PR files, a non-default PR base branch, unreadable workflows, or an approve error).
   It runs in the cross-repo `FLEET_TOKEN` scan step; every approved or no-pending run logs a `::notice::`, and every carded run logs a `::warning::wheelhouse auto-approve carded <repo>#<pr>: ...` line with the safety or uncertainty reason and, when an approval was attempted, the `approve_ci` status/message.
   Those log lines are status text only, not token values, and they do not change the approve/card decision or the card body warning.
-  Set `auto_approve_ci: false` (globally or per repo) to disable it.
+  Set `auto_approve_ci: false` (globally or per repo) to disable it for contributor PRs; owner, maintainer, and bot-authored fork PRs still run the safety-gated approve/noop path when safe because they are excluded from the decision queue.
   - **The `pull_request_target` caveat (stated plainly).**
     This approval gates the fork's read-only `pull_request` CI run.
     A `pull_request_target` workflow runs **automatically with your repo's secrets regardless of any approval**, so Wheelhouse cannot gate that vector by withholding approval.

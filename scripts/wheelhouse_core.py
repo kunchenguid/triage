@@ -668,12 +668,13 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
                 if default_posture is None:
                     default_posture = repo_pr_target_posture(slug)
                 posture = default_posture
+            approve_enabled = auto_enabled or author_excluded
             handled, card_note, log_note = _auto_approve_or_card(
                 owner,
                 name,
                 pr["number"],
                 posture,
-                auto_enabled,
+                approve_enabled,
                 pr.get("changed_files"),
             )
             if handled:

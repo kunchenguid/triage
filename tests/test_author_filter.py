@@ -100,6 +100,8 @@ def run_build_repo(
     issue_nodes=None,
     *,
     card_issues=False,
+    auto_approve_ci=True,
+    repo_auto_approve_ci=None,
     approve_result=("error", "api fail"),
     ci_safety_result=None,
 ):
@@ -109,6 +111,8 @@ def run_build_repo(
         "compliance_check": "Gate",
         "test_check_patterns": ["test"],
     }
+    if repo_auto_approve_ci is not None:
+        repo_cfg["auto_approve_ci"] = repo_auto_approve_ci
 
     def fake_graphql(owner, name):
         return graphql_data(pr_nodes, issue_nodes)
@@ -119,7 +123,7 @@ def run_build_repo(
             "maintainer": "co-maintainer",
             "nl_decisions": False,
             "card_issues": card_issues,
-            "auto_approve_ci": True,
+            "auto_approve_ci": auto_approve_ci,
         }
 
     def fake_approve(owner, name, pr, posture=None, strict=False):
@@ -160,7 +164,7 @@ def run_build_repo(
     try:
         with redirect_stderr(err):
             result, items = core.build_repo(
-                "owner", repo_cfg, card_issues, auto_approve_ci=True
+                "owner", repo_cfg, card_issues, auto_approve_ci=auto_approve_ci
             )
     finally:
         (
@@ -262,6 +266,47 @@ def test_ci_approval_author_filter_suppresses_cards_after_approve_failure():
     )
 
 
+def check_ci_approval_author_filter_bypasses_opt_out(label, **kwargs):
+    prs = [needs_ci_pr(50, OWNER), needs_ci_pr(51, HUMAN)]
+    result, items, calls = run_build_repo(
+        prs, approve_result=("approved", "ok"), **kwargs
+    )
+    numbers = [it["number"] for it in items]
+    check(
+        "author-filter: %s excluded safe CI bypasses opt-out" % label,
+        calls["approve"] == ["50"],
+    )
+    check(
+        "author-filter: %s excluded safe CI card suppressed" % label,
+        50 not in numbers,
+    )
+    check(
+        "author-filter: %s human safe CI still cards" % label,
+        numbers == [51],
+    )
+    check(
+        "author-filter: %s excluded safe CI logs notice" % label,
+        "::notice::demo#50 auto-approved" in calls["stderr"],
+    )
+    check(
+        "author-filter: %s human opt-out logs carded warning" % label,
+        "auto-approve carded demo#51: verdict safe (clean); not auto-approved (auto-approve disabled)"
+        in calls["stderr"],
+    )
+
+
+def test_ci_approval_author_filter_bypasses_global_opt_out_for_excluded_author():
+    check_ci_approval_author_filter_bypasses_opt_out(
+        "global opt-out", auto_approve_ci=False
+    )
+
+
+def test_ci_approval_author_filter_bypasses_repo_opt_out_for_excluded_author():
+    check_ci_approval_author_filter_bypasses_opt_out(
+        "repo opt-out", repo_auto_approve_ci=False
+    )
+
+
 def test_ci_approval_author_filter_suppresses_unsafe_cards_without_approve():
     risky = {
         "safe": False,
@@ -326,6 +371,8 @@ def main():
     test_pr_author_filter_skips_owner_maintainer_and_bots()
     test_ci_approval_author_filter_preserves_safe_auto_approve()
     test_ci_approval_author_filter_suppresses_cards_after_approve_failure()
+    test_ci_approval_author_filter_bypasses_global_opt_out_for_excluded_author()
+    test_ci_approval_author_filter_bypasses_repo_opt_out_for_excluded_author()
     test_ci_approval_author_filter_suppresses_unsafe_cards_without_approve()
     test_ci_approval_author_filter_suppresses_unknown_fork_cards()
     test_issue_author_filter_matches_pr_filter()
