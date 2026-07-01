@@ -350,7 +350,16 @@ def do_merge(owner, repo, number, head_sha):
             fields={"merge_method": method},
         )
     except RuntimeError as e:
-        return ("Merge of %s#%s failed: %s" % (repo, number, str(e)[:200]), "error")
+        detail = str(e)[:200]
+        if "conflict" in detail.lower():
+            return (
+                "Merge of %s#%s failed because the PR has a merge conflict. "
+                "The contributor must rebase or merge the base branch, resolve "
+                "the conflict, and push before this can be merged. (%s)"
+                % (repo, number, detail),
+                "error",
+            )
+        return ("Merge of %s#%s failed: %s" % (repo, number, detail), "error")
     return ("Merged %s#%s (%s)." % (repo, number, method), "resolved")
 
 

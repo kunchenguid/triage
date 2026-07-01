@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""
+Unit-exercise merge-conflict routing and contributor nudges with NO network.
+
+Run: python tests/test_merge_conflict.py
+"""
+import io
+import json
+import os
+import re
+import sys
+import tempfile
+from contextlib import redirect_stderr, redirect_stdout
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+import reconcile  # noqa: E402
+import wheelhouse_core as core  # noqa: E402
+
+_failures = []
+
+
+def check(name, cond):
+    print(("ok   " if cond else "FAIL ") + name)
+    if not cond:
+        _failures.append(name)
+
+
+def check_run(name, conclusion="SUCCESS", status="COMPLETED"):
+    return {
+        "__typename": "CheckRun",
+        "name": name,
+        "conclusion": conclusion,
+        "status": status,
+    }
+
+
+def rollup(contexts):
+    return {"state": "SUCCESS", "contexts": {"nodes": contexts}}
+
+
+def green_rollup():
+    return rollup([check_run("Gate"), check_run("test")])
+
+
+HUMAN = {"login": "contributor", "__typename": "User"}
+OWNER = {"login": "owner", "__typename": "User"}
+BOT = {"login": "dependabot[bot]", "__typename": "Bot"}
+
+
+def pr_node(
+    number,
+    *,
+    status_rollup=None,
+    mergeable="MERGEABLE",
+    cross_repo=False,
+    author=None,
+):
+    if status_rollup == "green":
+        status_rollup = green_rollup()
+    if author is None:
+        author = HUMAN
+    node = {
+        "number": number,
+        "title": "PR %d" % number,
+        "isDraft": False,
+        "isCrossRepository": cross_repo,
+        "mergeable": mergeable,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "changedFiles": 1,
+        "author": author,
+        "headRefName": "feature-%d" % number,
+        "headRefOid": "sha%d" % number,
+        "baseRefName": "main",
+        "headRepository": {"name": "demo-fork", "owner": {"login": "forker"}},
+        "baseRepository": {"name": "demo", "owner": {"login": "owner"}},
+        "labels": {"nodes": []},
+        "closingIssuesReferences": {"nodes": []},
+        "commits": {"nodes": [{"commit": {"statusCheckRollup": status_rollup}}]},
+    }
+    if cross_repo is False:
+        node["headRepository"] = {"name": "demo", "owner": {"login": "owner"}}
+    return node
+
+
+def issue_node(number, author=None):
+    if author is None:
+        author = HUMAN
+    return {
+        "number": number,
+        "title": "Issue %d" % number,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "author": author,
+        "labels": {"nodes": []},
+    }
+
+
+def graphql_data(pr_nodes=None, issue_nodes=None):
+    pr_nodes = list(pr_nodes or [])
+    issue_nodes = list(issue_nodes or [])
+    return {
+        "defaultBranchRef": {"name": "main"},
+        "pullRequests": {"totalCount": len(pr_nodes), "nodes": pr_nodes},
+        "issues": {"totalCount": len(issue_nodes), "nodes": issue_nodes},
+    }
+
+
+def _issue_number_from_comments_path(path):
+    match = re.search(r"/issues/(\d+)/comments", path)
+    if not match:
+        raise AssertionError("unexpected gh_rest path: %s" % path)
+    return int(match.group(1))
+
+
+def run_build_repo(
+    pr_nodes=None,
+    issue_nodes=None,
+    *,
+    card_issues=False,
+    auto_approve_ci=False,
+    comments_by_pr=None,
+):
+    comments_by_pr = comments_by_pr if comments_by_pr is not None else {}
+    calls = {"posts": [], "fetches": [], "safety": []}
+    repo_cfg = {
+        "name": "demo",
+        "compliance_check": "Gate",
+        "test_check_patterns": ["test"],
+    }
+
+    def fake_graphql(owner, name):
+        return graphql_data(pr_nodes, issue_nodes)
+
+    def fake_load_config():
+        return {
+            "repos": {"demo": repo_cfg},
+            "maintainer": "co-maintainer",
+            "nl_decisions": False,
+            "card_issues": card_issues,
+            "auto_approve_ci": auto_approve_ci,
+        }
+
+    def fake_rest(path, method=None, fields=None, jq=None, paginate=False, slurp=False):
+        number = _issue_number_from_comments_path(path)
+        if method == "POST":
+            body = (fields or {}).get("body", "")
+            calls["posts"].append({"number": number, "body": body})
+            comments_by_pr.setdefault(number, []).append({"body": body})
+            return {"id": len(comments_by_pr[number])}
+        calls["fetches"].append(
+            {"number": number, "paginate": paginate, "slurp": slurp}
+        )
+        comments = list(comments_by_pr.get(number, []))
+        return [comments] if slurp else comments
+
+    def fake_ci_safety(slug, pr, posture, changed_files=None):
+        calls["safety"].append((slug, pr, posture, changed_files))
+        return {
+            "safe": True,
+            "error": False,
+            "risky_files": [],
+            "pr_target": False,
+            "exploit": False,
+            "reason": "clean",
+        }
+
+    save = (
+        core.gh_graphql,
+        core.gh_rest,
+        core.load_config,
+        core.repo_pr_target_posture,
+        core.ci_safety,
+        os.environ.get("OWNER"),
+        os.environ.get("GITHUB_REPOSITORY_OWNER"),
+    )
+    core.gh_graphql = fake_graphql
+    core.gh_rest = fake_rest
+    core.load_config = fake_load_config
+    core.repo_pr_target_posture = lambda slug: {
+        "pr_target": False,
+        "exploit": False,
+        "error": False,
+    }
+    core.ci_safety = fake_ci_safety
+    os.environ["OWNER"] = "owner"
+    os.environ["GITHUB_REPOSITORY_OWNER"] = "owner"
+    err = io.StringIO()
+    try:
+        with redirect_stderr(err):
+            result, items = core.build_repo(
+                "owner", repo_cfg, card_issues, auto_approve_ci=auto_approve_ci
+            )
+    finally:
+        (
+            core.gh_graphql,
+            core.gh_rest,
+            core.load_config,
+            core.repo_pr_target_posture,
+            core.ci_safety,
+            old_owner,
+            old_repo_owner,
+        ) = save
+        if old_owner is None:
+            os.environ.pop("OWNER", None)
+        else:
+            os.environ["OWNER"] = old_owner
+        if old_repo_owner is None:
+            os.environ.pop("GITHUB_REPOSITORY_OWNER", None)
+        else:
+            os.environ["GITHUB_REPOSITORY_OWNER"] = old_repo_owner
+    calls["stderr"] = err.getvalue()
+    return result, items, calls
+
+
+def labels(*names):
+    return [{"name": n} for n in names]
+
+
+def body_state(repo="demo", number=42, kind="pr-review"):
+    state = {
+        "repo": repo,
+        "number": number,
+        "kind": kind,
+        "head_sha": "sha%d" % number,
+        "options": ["merge", "close", "hold"],
+        "comp": "pass",
+        "tests": "green",
+        "priority": "med",
+    }
+    return "<!-- wheelhouse-state: %s -->" % json.dumps(state, separators=(",", ":"))
+
+
+def card(number=91, target=42):
+    return {
+        "number": number,
+        "body": body_state(number=target),
+        "labels": labels(
+            "needs-decision",
+            "repo:demo",
+            "kind:pr-review",
+            "priority:med",
+            "target:demo-%d" % target,
+        ),
+        "title": "[demo#%d] Ready PR" % target,
+    }
+
+
+def run_reconcile(scan, cards, current_cards=None):
+    calls = {"upsert": [], "close": []}
+    current_by_number = {
+        c["number"]: c
+        for c in (cards if current_cards is None else current_cards)
+    }
+
+    def fake_upsert(item, existing=None):
+        calls["upsert"].append({"item": item, "existing": existing})
+
+    def fake_close(number, message, label="resolved"):
+        calls["close"].append({"number": number, "message": message, "label": label})
+
+    def fake_get_card(number):
+        return current_by_number.get(int(number))
+
+    old_argv = sys.argv[:]
+    old_upsert = reconcile.render_card.upsert_card
+    old_close = reconcile.render_card.close_card
+    old_get_card = reconcile.render_card.get_card
+    reconcile.render_card.upsert_card = fake_upsert
+    reconcile.render_card.close_card = fake_close
+    reconcile.render_card.get_card = fake_get_card
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            scan_path = os.path.join(d, "scan.json")
+            cards_path = os.path.join(d, "cards.json")
+            with open(scan_path, "w") as f:
+                json.dump(scan, f)
+            with open(cards_path, "w") as f:
+                json.dump(cards, f)
+            sys.argv = ["reconcile.py", scan_path, cards_path]
+            with redirect_stdout(io.StringIO()):
+                reconcile.main()
+    finally:
+        sys.argv = old_argv
+        reconcile.render_card.upsert_card = old_upsert
+        reconcile.render_card.close_card = old_close
+        reconcile.render_card.get_card = old_get_card
+    return calls
+
+
+def test_graphql_fetches_mergeability():
+    check("fetch: GraphQL query requests mergeable", " mergeable" in core.GQL)
+
+
+def test_classify_conflict_routes_pr_review_to_rebase():
+    check(
+        "classify: conflicting merge-ready PR waits for rebase",
+        core.classify(False, "pass", "green", True, False, "CONFLICTING")
+        == "needs-rebase",
+    )
+    check(
+        "classify: conflicting review-needed PR waits for rebase",
+        core.classify(False, "pass", "none", True, False, "CONFLICTING")
+        == "needs-rebase",
+    )
+
+
+def test_unknown_mergeability_fails_open():
+    check(
+        "classify: UNKNOWN mergeability keeps merge-ready route",
+        core.classify(False, "pass", "green", True, False, "UNKNOWN")
+        == "merge-ready",
+    )
+    check(
+        "classify: null mergeability keeps merge-ready route",
+        core.classify(False, "pass", "green", True, False, None) == "merge-ready",
+    )
+
+
+def test_ci_approval_not_rerouted_by_conflict():
+    check(
+        "classify: conflicted fork without CI still needs CI approval",
+        core.classify(False, "none", "none", False, True, "CONFLICTING")
+        == "needs-ci-approval",
+    )
+    pr = pr_node(10, status_rollup=None, mergeable="CONFLICTING", cross_repo=True)
+    result, items, calls = run_build_repo([pr], auto_approve_ci=False)
+    check("build: ci-approval repo scan stays ok", result["ok"] is True)
+    check(
+        "build: conflicted fork without CI still emits ci-approval card",
+        len(items) == 1
+        and items[0]["kind"] == "ci-approval"
+        and items[0]["bucket"] == "needs-ci-approval",
+    )
+    check("build: ci-approval conflict does not nudge", calls["posts"] == [])
+
+
+def test_conflicted_pr_suppresses_card_and_nudges_once_per_head():
+    comments = {}
+    pr = pr_node(42, status_rollup="green", mergeable="CONFLICTING")
+    result1, items1, calls1 = run_build_repo([pr], comments_by_pr=comments)
+    result2, items2, calls2 = run_build_repo([pr], comments_by_pr=comments)
+    check("nudge: conflicted PR keeps repo scan ok", result1["ok"] is True)
+    check("nudge: conflicted PR remains open in scan state", result1["open_pr_numbers"] == [42])
+    check("nudge: conflicted PR emits no decision card", items1 == [] and items2 == [])
+    check("nudge: first scan posts one comment", len(calls1["posts"]) == 1)
+    check("nudge: second scan posts no duplicate", calls2["posts"] == [])
+    body = calls1["posts"][0]["body"] if calls1["posts"] else ""
+    check("nudge: body names the rebase action", "rebase" in body and "resolve the conflict" in body)
+    check("nudge: body carries a head-specific marker", core._rebase_nudge_marker("sha42") in body)
+    check("nudge: comment fetch uses pagination slurp", calls1["fetches"] and calls1["fetches"][0]["slurp"] is True)
+    check("nudge: marker persists in stored comments", len(comments.get(42, [])) == 1)
+    check("nudge: second scan still ok", result2["ok"] is True)
+
+
+def test_nudge_skips_owner_and_bot_authors():
+    prs = [
+        pr_node(50, status_rollup="green", mergeable="CONFLICTING", author=OWNER),
+        pr_node(51, status_rollup="green", mergeable="CONFLICTING", author=BOT),
+    ]
+    result, items, calls = run_build_repo(prs)
+    check("nudge-skip: owner and bot scan stays ok", result["ok"] is True)
+    check("nudge-skip: owner and bot cards are suppressed", items == [])
+    check("nudge-skip: owner and bot are not nudged", calls["posts"] == [])
+    check("nudge-skip: owner and bot do not fetch comments", calls["fetches"] == [])
+
+
+def test_issue_triage_unaffected():
+    result, items, calls = run_build_repo(
+        [], [issue_node(70)], card_issues=True
+    )
+    check("issue: repo scan stays ok", result["ok"] is True)
+    check(
+        "issue: issue-triage card still emits",
+        len(items) == 1 and items[0]["kind"] == "issue-triage",
+    )
+    check("issue: issue-triage does not nudge", calls["posts"] == [])
+
+
+def test_reconcile_consumes_conflicted_card_that_left_worklist():
+    scan = {
+        "repos": {
+            "demo": {
+                "ok": True,
+                "open_pr_numbers": [42],
+                "open_issue_numbers": [],
+            }
+        },
+        "items": [],
+    }
+    calls = run_reconcile(scan, [card(number=91, target=42)])
+    check("reconcile: conflicted target outside worklist has no upsert", calls["upsert"] == [])
+    check(
+        "reconcile: conflicted target outside worklist closes stale card",
+        len(calls["close"]) == 1 and calls["close"][0]["number"] == 91,
+    )
+    check(
+        "reconcile: stale card close explains no maintainer decision needed",
+        "no longer needs a maintainer decision" in calls["close"][0]["message"],
+    )
+
+
+def main():
+    test_graphql_fetches_mergeability()
+    test_classify_conflict_routes_pr_review_to_rebase()
+    test_unknown_mergeability_fails_open()
+    test_ci_approval_not_rerouted_by_conflict()
+    test_conflicted_pr_suppresses_card_and_nudges_once_per_head()
+    test_nudge_skips_owner_and_bot_authors()
+    test_issue_triage_unaffected()
+    test_reconcile_consumes_conflicted_card_that_left_worklist()
+    print()
+    if _failures:
+        print("%d FAILED: %s" % (len(_failures), ", ".join(_failures)))
+        sys.exit(1)
+    print("all merge conflict tests passed")
+
+
+if __name__ == "__main__":
+    main()

@@ -3,17 +3,19 @@
 Wheelhouse - deterministic brain (ported from the local OSS-triage machinery).
 
 Runs inside GitHub Actions. One GraphQL query per repo fetches every open
-PR/issue with compliance + test status, classifies each deterministically, and
-emits a worklist of items that need the maintainer's decision. The scan excludes
-known owner, configured maintainer, and bot authors from that worklist while
-failing open when author metadata is missing. Also carries the
-security-gated CI approval (the fork-CI / pwn-request HOLD) and the scan-time
-auto-approval of provably-safe fork-CI runs (so only contributor-authored risky
-or uncertain ones raise a card, excluded-author failures log suppressed-card,
-and verified no-pending runs emit no stale card). The auto path
-logs exactly one stderr workflow-command line per CI-approval candidate it
-handles, so approvals, no-pending results, approve failures, and fail-closed
-verdicts are visible in the scan-backstop run log.
+PR/issue with compliance + test status + mergeability, classifies each
+deterministically, and emits a worklist of items that need the maintainer's
+decision. The scan excludes known owner, configured maintainer, and bot authors
+from that worklist while failing open when author metadata is missing. Also
+carries the security-gated CI approval (the fork-CI / pwn-request HOLD) and the
+scan-time auto-approval of provably-safe fork-CI runs (so only
+contributor-authored risky or uncertain ones raise a card, excluded-author
+failures log suppressed-card, and verified no-pending runs emit no stale card).
+The auto path logs exactly one stderr workflow-command line per CI-approval
+candidate it handles, so approvals, no-pending results, approve failures, and
+fail-closed verdicts are visible in the scan-backstop run log. Conflicted
+PR-review candidates leave the maintainer worklist as needs-rebase, with one
+contributor rebase nudge per head SHA.
 Approval verifies each awaiting run against the target PR: populated
 workflow_run.pull_requests must name that PR, while fork-originated empty
 associations must match the PR head SHA and branch.
@@ -24,8 +26,8 @@ replaces has been dropped: the local single-flight lock (-> Actions
 state), per-repo `owner` (-> derived from github.repository_owner).
 
 Usage:
-  wheelhouse_core.py scan                 scan all configured repos -> JSON worklist; may auto-approve safe fork CI and log outcomes
-  wheelhouse_core.py scan <repo>          scan a single configured repo; may auto-approve safe fork CI and log outcomes
+  wheelhouse_core.py scan                 scan all configured repos -> JSON worklist; may auto-approve safe fork CI, nudge conflicted PR-review candidates, and log outcomes
+  wheelhouse_core.py scan <repo>          scan a single configured repo; may auto-approve safe fork CI, nudge conflicted PR-review candidates, and log outcomes
   wheelhouse_core.py approve-ci <repo> <pr>   security-gated fork-CI approval (exit 4 = HOLD)
   wheelhouse_core.py checks <repo>        list distinct check names on a repo's PRs (onboarding)
   wheelhouse_core.py authorized           print true/false: is $SENDER allowed to drive decisions?
@@ -68,7 +70,7 @@ query($owner:String!, $name:String!) {
     pullRequests(states:OPEN, first:100, orderBy:{field:UPDATED_AT, direction:DESC}) {
       totalCount
       nodes {
-        number title isDraft updatedAt changedFiles isCrossRepository
+        number title isDraft updatedAt changedFiles isCrossRepository mergeable
         author { login __typename }
         headRefName headRefOid baseRefName
         headRepository { name owner { login } }
@@ -95,7 +97,8 @@ query($owner:String!, $name:String!) {
 
 # Buckets that need the maintainer's call vs. ones waiting on the contributor.
 NEEDS_MAINTAINER = {"merge-ready", "needs-ci-approval", "review-needed"}
-# (waiting-on-contributor: needs-reraise, fix-tests, draft, ci-running)
+# (waiting-on-contributor: needs-reraise, needs-rebase, fix-tests, draft, ci-running)
+REBASE_NUDGE_MARKER_PREFIX = "wheelhouse-rebase-nudge"
 
 # Decision-card "kind" per PR bucket.
 PR_KIND = {
@@ -176,12 +179,14 @@ def gh_graphql(owner, name):
     return data["data"]["repository"]
 
 
-def gh_rest(path, method=None, fields=None, jq=None, paginate=False):
+def gh_rest(path, method=None, fields=None, jq=None, paginate=False, slurp=False):
     cmd = ["gh", "api"]
     if method:
         cmd += ["--method", method]
     if paginate:
         cmd += ["--paginate"]
+    if slurp:
+        cmd += ["--slurp"]
     cmd += [path]
     for k, v in (fields or {}).items():
         cmd += ["-f", "%s=%s" % (k, v)]
@@ -304,12 +309,31 @@ def _pr_is_cross_repo(pr):
     return head != base
 
 
-def classify(draft, comp, tests, ci, cross_repo=True):
+def _mergeable_is_conflicting(mergeable):
+    return str(mergeable or "").strip().upper() == "CONFLICTING"
+
+
+def _with_mergeability(bucket, mergeable):
+    if bucket in ("merge-ready", "review-needed") and _mergeable_is_conflicting(
+        mergeable
+    ):
+        return "needs-rebase"
+    return bucket
+
+
+def classify(draft, comp, tests, ci, cross_repo=True, mergeable=None):
+    """Return the PR routing bucket.
+
+    Only an authoritative GraphQL `mergeable=CONFLICTING` rewrites PR-review
+    buckets (`merge-ready` / `review-needed`) to waiting-on-contributor
+    `needs-rebase`. UNKNOWN or missing mergeability fails open, and fork
+    `needs-ci-approval` routing is independent of mergeability.
+    """
     if draft:
         return "draft"
     if not ci:
         if cross_repo is False:
-            return "review-needed"
+            return _with_mergeability("review-needed", mergeable)
         return "needs-ci-approval"
     if comp == "fail":
         return "needs-reraise"
@@ -317,16 +341,18 @@ def classify(draft, comp, tests, ci, cross_repo=True):
         return "ci-running"
     if comp in ("pass", "n/a"):
         if tests == "green":
-            return "merge-ready"
+            return _with_mergeability("merge-ready", mergeable)
         if tests == "fail":
             return "fix-tests"
         if tests == "pending":
             return "ci-running"
         if tests == "none":
-            return (
-                "review-needed"  # compliant but no test signal - look before trusting
-            )
-    return "review-needed"  # comp missing-but-ci-present, or anything unmodeled
+            return _with_mergeability(
+                "review-needed", mergeable
+            )  # compliant but no test signal - look before trusting
+    return _with_mergeability(
+        "review-needed", mergeable
+    )  # comp missing-but-ci-present, or anything unmodeled
 
 
 def config_warning(repo, comp, names):
@@ -438,6 +464,90 @@ def _display_list(values, limit=10):
 
 def _workflow_command_text(value):
     return re.sub(r"[\r\n]+", " ", str(value))
+
+
+def _rebase_nudge_marker(head_sha):
+    return "<!-- %s:%s -->" % (
+        REBASE_NUDGE_MARKER_PREFIX,
+        str(head_sha or "").strip(),
+    )
+
+
+def _flatten_paginated_comments(data):
+    if not isinstance(data, list):
+        return []
+    if data and all(isinstance(page, list) for page in data):
+        comments = []
+        for page in data:
+            comments.extend(page)
+        return comments
+    return data
+
+
+def _has_rebase_nudge(comments, head_sha):
+    marker = _rebase_nudge_marker(head_sha)
+    for comment in _flatten_paginated_comments(comments):
+        if not isinstance(comment, dict):
+            continue
+        if marker in str(comment.get("body") or ""):
+            return True
+    return False
+
+
+def _rebase_nudge_body(repo, number, head_sha):
+    marker = _rebase_nudge_marker(head_sha)
+    short = str(head_sha or "").strip()[:8] or "current head"
+    return (
+        "Thanks for the PR. Wheelhouse found that this branch currently has a "
+        "merge conflict with the base branch, so it is stepping out of the "
+        "maintainer queue for now.\n\n"
+        "Please rebase on or merge the base branch into your branch, resolve "
+        "the conflict, and push the result. Once GitHub reports the PR as "
+        "mergeable again, Wheelhouse will resurface it for maintainer review.\n\n"
+        "<sub>Conflict noted for %s#%s at `%s`.</sub>\n"
+        "%s"
+        % (repo, number, short, marker)
+    )
+
+
+def _post_rebase_nudge_if_needed(slug, repo, number, head_sha):
+    comments = gh_rest(
+        "/repos/%s/issues/%s/comments?per_page=100" % (slug, number),
+        paginate=True,
+        slurp=True,
+    )
+    if _has_rebase_nudge(comments, head_sha):
+        return False
+    gh_rest(
+        "/repos/%s/issues/%s/comments" % (slug, number),
+        method="POST",
+        fields={"body": _rebase_nudge_body(repo, number, head_sha)},
+    )
+    return True
+
+
+def _maybe_nudge_rebase(slug, repo, pr):
+    try:
+        posted = _post_rebase_nudge_if_needed(
+            slug, repo, pr["number"], pr.get("head_sha")
+        )
+    except Exception as e:
+        print(
+            "::warning::wheelhouse rebase-nudge failed %s#%s: %s"
+            % (repo, pr["number"], _workflow_command_text(str(e)[:160])),
+            file=sys.stderr,
+        )
+        return
+    if posted:
+        print(
+            "::notice::wheelhouse rebase-nudge posted %s#%s for %s"
+            % (
+                repo,
+                pr["number"],
+                _workflow_command_text(str(pr.get("head_sha") or "")[:12]),
+            ),
+            file=sys.stderr,
+        )
 
 
 def _non_default_base_posture(base_ref, default_branch):
@@ -560,8 +670,10 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
     card; risky/uncertain contributor PRs still become cards while excluded-author
     PRs only log suppressed-card warnings. Each handled ci-approval PR also emits
     exactly one stderr notice/warning outcome line.
-    This runs only on the ok:true success path below, so an ok:false repo (early
-    return) is never auto-approved."""
+    Conflicted PR-review candidates become `needs-rebase`: no decision card is
+    emitted, and contributor-authored PRs get at most one rebase nudge per head
+    SHA via a hidden comment marker. This runs only on the ok:true success path
+    below, so an ok:false repo (early return) is never auto-approved or nudged."""
     name = repo_cfg["name"]
     slug = "%s/%s" % (owner, name)
     try:
@@ -592,7 +704,10 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
         comp, tests, ci, names = check_status(pr, repo_cfg)
         all_names.update(names)
         cross_repo = _pr_is_cross_repo(pr)
-        bucket = classify(pr["isDraft"], comp, tests, ci, cross_repo)
+        bucket = classify(
+            pr["isDraft"], comp, tests, ci, cross_repo, pr.get("mergeable")
+        )
+        author_excluded = _author_excluded_from_queue(author, maintainer_logins)
         closes = [i["number"] for i in pr["closingIssuesReferences"]["nodes"]]
         for i in closes:
             closing.setdefault(i, []).append(pr["number"])
@@ -601,9 +716,7 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
                 "number": pr["number"],
                 "title": pr["title"],
                 "author": _author_login(author) or "?",
-                "author_excluded": _author_excluded_from_queue(
-                    author, maintainer_logins
-                ),
+                "author_excluded": author_excluded,
                 "comp": comp,
                 "tests": tests,
                 "ci": ci,
@@ -615,6 +728,8 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
                 "cross_repo": cross_repo,
             }
         )
+        if bucket == "needs-rebase" and not author_excluded:
+            _maybe_nudge_rebase(slug, name, enriched[-1])
 
     open_issue_numbers = [it["number"] for it in issues]
     addressed = {n for n in closing if n in set(open_issue_numbers)}

@@ -235,6 +235,15 @@ still appears where it's plain English, e.g. "triage the queue".)
   This deliberately bypasses the global or per-repo `auto_approve_ci: false` opt-out only for those author-excluded ci-approval PRs; contributor PRs still honor the opt-out and card as before.
   Unsafe, uncertain, or failed owner, maintainer, and bot CI-approval targets still do not emit cards, but they keep the scan-log warning.
   Skipped targets still remain in `open_pr_numbers` / `open_issue_numbers` but are absent from the `items` worklist, so `reconcile.py` consumes any existing pure `needs-decision` owner, maintainer, or bot card on the next successful scan.
+- **Merge conflicts leave the maintainer queue.**
+  `wheelhouse_core.py` fetches GraphQL `pullRequests.nodes.mergeable` and treats only `CONFLICTING` as authoritative.
+  `UNKNOWN` or missing mergeability fails open because GitHub computes it asynchronously, so the PR classifies normally until a later scan can prove the conflict.
+  A conflicting PR that would otherwise route to `merge-ready` or `review-needed` becomes waiting-on-contributor `needs-rebase`, which is intentionally absent from `NEEDS_MAINTAINER`.
+  This never rewrites `needs-ci-approval`: fork CI approval is independent of whether the eventual merge would conflict, and issue triage is unrelated.
+  On the `ok:true` scan path, `build_repo` posts a contributor nudge under `FLEET_TOKEN` for non-owner/non-maintainer/non-bot `needs-rebase` PRs.
+  The nudge body carries hidden marker `<!-- wheelhouse-rebase-nudge:<head_sha> -->`; before posting, Wheelhouse paginates the PR comments and skips if that marker already exists, so it posts at most once per conflicted head SHA and can nudge again only after a new push creates a new head.
+  If comment lookup or posting fails, the scan logs a warning and still emits no card; it never posts without first checking for the current marker.
+  The PR stays in `open_pr_numbers` but drops out of `items`, so `reconcile.py` consumes any existing pure `needs-decision` card on the next successful scan.
 - **Scan-time fork-CI auto-approve (kill the routine "approve CI" click).** One
   shared `ci_safety(slug, pr, repo_posture)` verdict is the single security
   definition; `approve_ci` uses it too, so the auto path is a STRICT SUBSET of the
@@ -363,31 +372,18 @@ data; the LLM never gets `FLEET_TOKEN`):
 
 ## Validation
 
-No build step. Validate with `python -m py_compile scripts/*.py tests/*.py`, run
-the unit tests (`python tests/test_decision.py` - mocks the LLM, no network, and
-now also the non-consuming investigate routing / allow-set / `clear_checkbox`,
-`python tests/test_nl_decisions_search.py` - offline YAML wiring checks for the
-optional READONLY_TOKEN search path, token isolation, prompt gating, and
-unchanged `nl-route`/`execute` boundary,
-`python tests/test_card_refresh.py` - the card-refresh change-detection /
-refreshability-guard / label-replace logic, pure functions, no network,
-`python tests/test_reconcile.py` - reconcile routing and stale-card self-healing,
-no network, `python tests/test_ci_autoapprove.py` - the shared `ci_safety`
-verdict, `pull_request_target` posture detection, and the auto-approve-vs-card routing plus scan-log observability in `build_repo`, all with the network-touching helpers stubbed, and
-`python tests/test_author_filter.py` - queue author filtering across PR review,
-CI approval, and issue triage, no network, and
-`python tests/test_deep_review.py` - the always-on/code-grounded deep-review +
-Investigate wiring: render options, the removed enable flag, the token-absent
-note, the `persist-credentials: false` checkout + tool isolation, the
-narrow `allowed_bots`, the optional READONLY_TOKEN-gated `wheelhouse-search`
-wiring, the action-output verdict capture, issue-only manual dispatch, and the
-handler's immutable-input `workflow_dispatch` trigger, all by inspecting the
-scripts/YAML, no network), and
-YAML-parse `.github/workflows/*.yml` + `wheelhouse.config.yml` +
-`.github/ISSUE_TEMPLATE/*.yml` (run `actionlint` if available; fetch the binary
-via its `download-actionlint.bash` if not). The live LLM paths (deep-review,
-nl_decisions) can only be exercised end-to-end in CI with the token set (and, for
-nl_decisions, the flag on). Secrets the maintainer must add: `FLEET_TOKEN`
-(always), `CLAUDE_CODE_OAUTH_TOKEN` (for deep-review and/or nl_decisions), and
-optionally `READONLY_TOKEN` (public-read only, for nl_decisions and deep-review
-search).
+No build step.
+Validate with `python -m py_compile scripts/*.py tests/*.py`.
+Run the unit tests:
+- `python tests/test_decision.py` - mocks the LLM, no network, and also covers the non-consuming investigate routing, allow-set, and `clear_checkbox`.
+- `python tests/test_nl_decisions_search.py` - offline YAML wiring checks for the optional READONLY_TOKEN search path, token isolation, prompt gating, and unchanged `nl-route`/`execute` boundary.
+- `python tests/test_card_refresh.py` - the card-refresh change-detection, refreshability-guard, and label-replace logic, pure functions, no network.
+- `python tests/test_reconcile.py` - reconcile routing and stale-card self-healing, no network.
+- `python tests/test_merge_conflict.py` - mergeability fail-open vs CONFLICTING routing, idempotent rebase nudges, author-filter nudge skips, and reconcile self-healing for conflicted PR cards, no network.
+- `python tests/test_ci_autoapprove.py` - the shared `ci_safety` verdict, `pull_request_target` posture detection, and the auto-approve-vs-card routing plus scan-log observability in `build_repo`, all with the network-touching helpers stubbed.
+- `python tests/test_author_filter.py` - queue author filtering across PR review, CI approval, and issue triage, no network.
+- `python tests/test_deep_review.py` - the always-on/code-grounded deep-review and Investigate wiring: render options, the removed enable flag, the token-absent note, the `persist-credentials: false` checkout plus read-only tool isolation, the narrow `allowed_bots`, the optional READONLY_TOKEN-gated `wheelhouse-search` wiring, the action-output verdict capture, issue-only manual dispatch, and the handler's immutable-input `workflow_dispatch` trigger, all by inspecting the scripts/YAML, no network.
+YAML-parse `.github/workflows/*.yml` plus `wheelhouse.config.yml` plus `.github/ISSUE_TEMPLATE/*.yml`.
+Run `actionlint` if available; fetch the binary via its `download-actionlint.bash` if not.
+The live LLM paths (deep-review, nl_decisions) can only be exercised end-to-end in CI with the token set and, for nl_decisions, the flag on.
+Secrets the maintainer must add: `FLEET_TOKEN` always, `CLAUDE_CODE_OAUTH_TOKEN` for deep-review and/or nl_decisions, and optionally `READONLY_TOKEN` public-read only for nl_decisions and deep-review search.
