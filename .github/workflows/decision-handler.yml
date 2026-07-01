@@ -238,13 +238,12 @@ jobs:
       # and any resulting output is treated by the prompt as UNTRUSTED DATA.
       # Auth is the Claude subscription token, NOT an API key.
       #
-      # NOTE: pin a specific release of this action when you turn nl_decisions on
-      # (see deep-review.yml for the same convention).
+      # NOTE: keep this action pinned to the same reviewed release as deep-review.yml.
       - name: Claude interprets intent (read-only search)
         if: ${{ steps.nl-gate.outputs.proceed == 'true' && steps.nl-readonly.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.READONLY_TOKEN }}
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@fad22eb3fa582b7357fc0ea48af6645851b884fd # v1.0.161
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.READONLY_TOKEN }}
@@ -252,13 +251,14 @@ jobs:
           claude_args: |
             --allowedTools "Write,Bash(wheelhouse-search)"
             --max-turns 6
+            --model sonnet
 
       # Legacy no-search branch. This is the exact old tool posture: Write only,
       # no shell, and no GH_TOKEN environment. It runs whenever READONLY_TOKEN is
       # absent so the feature can ship before the optional secret exists.
       - name: Claude interprets intent
         if: ${{ steps.nl-gate.outputs.proceed == 'true' && steps.nl-readonly.outputs.enabled != 'true' }}
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@fad22eb3fa582b7357fc0ea48af6645851b884fd # v1.0.161
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
@@ -266,6 +266,7 @@ jobs:
           claude_args: |
             --allowedTools Write
             --max-turns 6
+            --model sonnet
 
       - id: nl-result
         if: steps.nl-gate.outputs.proceed == 'true'

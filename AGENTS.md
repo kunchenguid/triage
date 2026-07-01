@@ -337,6 +337,7 @@ from `claude setup-token` via `anthropics/claude-code-action` - NOT an Anthropic
 API key) and the same injection model (only owner-authored text is an
 instruction; target content and optional search output are delimited untrusted
 data; the LLM never gets `FLEET_TOKEN`):
+Every `anthropics/claude-code-action` LLM step is pinned to `v1.0.161` at commit `fad22eb3fa582b7357fc0ea48af6645851b884fd` and passes `--model sonnet`; on the Anthropic API, Claude Code v2.1.197 and later resolve `sonnet` to Sonnet 5.
 
 - **`deep-review.yml` - ALWAYS-ON, code-grounded (no enable flag).** Triggered by ticking the **Investigate** box on a card, by the repo owner applying the `needs-deep-review` label, or by the repo owner running `workflow_dispatch` with only `issue=...` for direct verification.
   Bot-dispatched Investigate runs use the immutable target inputs passed by `decision-handler.yml`; owner issue-only runs and manual label runs parse the current card body with `github.token`.

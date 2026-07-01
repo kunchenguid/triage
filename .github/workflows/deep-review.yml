@@ -382,7 +382,7 @@ jobs:
         if: ${{ steps.gate.outputs.enabled == 'true' && steps.verify_head.outputs.head_ok != 'false' && steps.readonly.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.READONLY_TOKEN }}
-        uses: anthropics/claude-code-action@4633baf5267540f3f8cb58b684f79901d564c280 # v1
+        uses: anthropics/claude-code-action@fad22eb3fa582b7357fc0ea48af6645851b884fd # v1.0.161
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.READONLY_TOKEN }}
@@ -396,6 +396,7 @@ jobs:
           claude_args: |
             --allowedTools "Read,Grep,Glob,Write,Bash(wheelhouse-search)"
             --max-turns 30
+            --model sonnet
 
       # Legacy no-search branch. This is the exact old tool posture:
       # Read/Grep/Glob only, no shell, no GH_TOKEN environment, and the default
@@ -404,7 +405,7 @@ jobs:
       - id: claude
         name: Claude deep review (code-grounded, read-only)
         if: ${{ steps.gate.outputs.enabled == 'true' && steps.verify_head.outputs.head_ok != 'false' && steps.readonly.outputs.enabled != 'true' }}
-        uses: anthropics/claude-code-action@4633baf5267540f3f8cb58b684f79901d564c280 # v1
+        uses: anthropics/claude-code-action@fad22eb3fa582b7357fc0ea48af6645851b884fd # v1.0.161
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
@@ -418,6 +419,7 @@ jobs:
           claude_args: |
             --allowedTools Read,Grep,Glob
             --max-turns 30
+            --model sonnet
 
       # Post the verdict on the card with THIS repo's token (never FLEET_TOKEN).
       # The workflow does the posting, not Claude. The action exposes the Claude

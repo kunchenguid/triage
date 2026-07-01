@@ -43,7 +43,7 @@ import render_card as rc  # noqa: E402
 import wheelhouse_core as core  # noqa: E402
 
 CLAUDE_ACTION_PIN = (
-    "anthropics/claude-code-action@4633baf5267540f3f8cb58b684f79901d564c280"
+    "anthropics/claude-code-action@fad22eb3fa582b7357fc0ea48af6645851b884fd"
 )
 _failures = []
 
@@ -344,7 +344,7 @@ def test_code_grounded_checkout_and_tool_isolation():
     for claude in llm_steps:
         dumped = yaml.safe_dump(claude)
         check(
-            "workflow: Claude action is pinned to the reviewed v1 commit",
+            "workflow: Claude action is pinned to the reviewed v1.0.161 commit",
             str(claude.get("uses", "")) == CLAUDE_ACTION_PIN,
         )
         check(
@@ -364,8 +364,8 @@ def test_code_grounded_checkout_and_tool_isolation():
         dumped = yaml.safe_dump(legacy)
         args = str((legacy.get("with") or {}).get("claude_args", "")).strip()
         check(
-            "security: legacy Claude is the byte-for-byte no-search tool mode",
-            args == "--allowedTools Read,Grep,Glob\n--max-turns 30",
+            "security: legacy Claude keeps no-search tools and Sonnet alias",
+            args == "--allowedTools Read,Grep,Glob\n--max-turns 30\n--model sonnet",
         )
         check(
             "security: legacy Claude has no GH_TOKEN env",
@@ -386,6 +386,10 @@ def test_code_grounded_checkout_and_tool_isolation():
         check(
             "security: legacy Claude is NOT granted Write",
             "Write" not in args,
+        )
+        check(
+            "workflow: legacy Claude uses Sonnet alias",
+            "--model sonnet" in args,
         )
         check(
             "security: legacy Claude runs only when readonly search is disabled",
@@ -420,6 +424,10 @@ def test_code_grounded_checkout_and_tool_isolation():
             and "Write" in args
             and "Bash(wheelhouse-search)" in args
         )
+        check(
+            "workflow: search Claude uses Sonnet alias",
+            "--model sonnet" in args,
+        )
         for forbidden in (
             "Bash(gh",
             "Bash(git",
@@ -433,8 +441,8 @@ def test_code_grounded_checkout_and_tool_isolation():
     # The verdict is posted by the workflow (default token), not by Claude.
     dr = read(".github", "workflows", "deep-review.yml")
     check(
-        "workflow: Claude action pin keeps the v1 breadcrumb",
-        f"uses: {CLAUDE_ACTION_PIN} # v1" in dr,
+        "workflow: Claude action pin keeps the v1.0.161 breadcrumb",
+        f"uses: {CLAUDE_ACTION_PIN} # v1.0.161" in dr,
     )
     post = next(
         (s for s in steps if "post the verdict" in str(s.get("name", "")).lower()), None

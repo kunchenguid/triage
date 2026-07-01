@@ -17,6 +17,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import nl_readonly_search as nls  # noqa: E402
 
+CLAUDE_ACTION_PIN = (
+    "anthropics/claude-code-action@fad22eb3fa582b7357fc0ea48af6645851b884fd"
+)
 _failures = []
 
 
@@ -153,12 +156,18 @@ def test_claude_steps_split_legacy_vs_search():
     check("workflow: legacy no-search Claude step exists", legacy is not None)
     check("workflow: read-only search Claude step exists", search is not None)
 
+    for claude in llm_steps:
+        check(
+            "workflow: Claude action is pinned to the reviewed v1.0.161 commit",
+            str(claude.get("uses", "")) == CLAUDE_ACTION_PIN,
+        )
+
     if legacy:
         dumped = yaml.safe_dump(legacy)
         args = str((legacy.get("with") or {}).get("claude_args", "")).strip()
         check(
-            "workflow: legacy step is the byte-for-byte no-shell tool mode",
-            args == "--allowedTools Write\n--max-turns 6",
+            "workflow: legacy step keeps the no-shell tool mode and Sonnet alias",
+            args == "--allowedTools Write\n--max-turns 6\n--model sonnet",
         )
         check(
             "workflow: legacy step has no GH_TOKEN env",
@@ -175,6 +184,10 @@ def test_claude_steps_split_legacy_vs_search():
         check(
             "workflow: legacy step runs only when readonly search is disabled",
             "steps.nl-readonly.outputs.enabled != 'true'" in str(legacy.get("if", "")),
+        )
+        check(
+            "workflow: legacy step uses Sonnet alias",
+            "--model sonnet" in args,
         )
 
     if search:
@@ -204,6 +217,10 @@ def test_claude_steps_split_legacy_vs_search():
         )
         for pattern in ("Write", "Bash(wheelhouse-search)"):
             check("workflow: search step allows %s" % pattern, pattern in args)
+        check(
+            "workflow: search step uses Sonnet alias",
+            "--model sonnet" in args,
+        )
         for forbidden in (
             "FLEET_TOKEN",
             "Bash(gh",
@@ -226,6 +243,12 @@ def test_claude_steps_split_legacy_vs_search():
             "--open-files-in-pager",
         ):
             check("workflow: search step does not allow %s" % forbidden, forbidden not in args)
+
+    dh = read(".github", "workflows", "decision-handler.yml")
+    check(
+        "workflow: Claude action pin keeps the v1.0.161 breadcrumb",
+        f"uses: {CLAUDE_ACTION_PIN} # v1.0.161" in dh,
+    )
 
 
 def test_search_wrapper_repositories_are_owner_scoped():
