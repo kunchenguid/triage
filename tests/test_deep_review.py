@@ -17,11 +17,12 @@ so these tests pin the *wiring* instead:
     than silently no-opping;
   * code-grounded + security: deep-review.yml checks out the target with
     FLEET_TOKEN and `persist-credentials: false`, runs Claude restricted to
-    read-only exploration tools (Read/Grep/Glob), and the Claude step never
-    receives FLEET_TOKEN; it narrowly allows only the GitHub Actions bot because
-    maintainer-gated Investigate dispatches this workflow via github.token; the
-    trusted post step captures the action's final output from `execution_file`
-    and posts it with the default token;
+    read-only exploration tools (Read/Grep/Glob, plus optional Write for
+    search-request.json and Bash(wheelhouse-search) only when READONLY_TOKEN
+    exists), and the Claude step never receives FLEET_TOKEN; it narrowly allows
+    only the GitHub Actions bot because maintainer-gated Investigate dispatches
+    this workflow via github.token; the trusted post step captures the action's
+    final output from `execution_file` and posts it with the default token;
   * prompt boundary: the mutable decision card, target diff/issue text, and
     target code are all presented as delimited untrusted data;
   * investigate trigger: decision-handler.yml keeps `actions: write` only on an
@@ -64,6 +65,18 @@ def load_yaml(*parts):
 
 def steps_of(workflow_doc, job):
     return workflow_doc["jobs"][job]["steps"]
+
+
+def step_by_id(steps, step_id):
+    return next((s for s in steps if s.get("id") == step_id), None)
+
+
+def step_index(steps, predicate):
+    return next((i for i, step in enumerate(steps) if predicate(step)), None)
+
+
+def claude_steps(steps):
+    return [s for s in steps if "claude-code-action" in str(s.get("uses", ""))]
 
 
 # --------------------------------------------------------------------------- #
@@ -147,6 +160,104 @@ def test_token_absent_message():
     )
 
 
+def test_readonly_search_wiring():
+    doc = load_yaml(".github", "workflows", "deep-review.yml")
+    steps = steps_of(doc, "deep-review")
+    gate = step_by_id(steps, "readonly")
+    prompt = step_by_id(steps, "prepare")
+    install = step_by_id(steps, "search-tool")
+    search = step_by_id(steps, "claude_search")
+    legacy = step_by_id(steps, "claude")
+
+    check("workflow: readonly search gate step exists", gate is not None)
+    if gate:
+        env = gate.get("env", {})
+        run = str(gate.get("run", ""))
+        check(
+            "workflow: readonly gate compares the optional READONLY_TOKEN secret",
+            env.get("HAS_READONLY_TOKEN") == "${{ secrets.READONLY_TOKEN != '' }}",
+        )
+        check(
+            "workflow: readonly gate emits an enabled output",
+            'echo "enabled=$HAS_READONLY_TOKEN"' in run
+            and "$GITHUB_OUTPUT" in run,
+        )
+
+    check("workflow: prompt step is gated by readonly output", prompt is not None)
+    if prompt:
+        env = prompt.get("env", {})
+        run = str(prompt.get("run", ""))
+        check(
+            "workflow: prompt receives readonly search flag",
+            env.get("READONLY_SEARCH_ENABLED")
+            == "${{ steps.readonly.outputs.enabled }}",
+        )
+        check(
+            "workflow: search prompt language is conditional",
+            'if [ "${READONLY_SEARCH_ENABLED:-false}" = "true" ]; then' in run
+            and "wheelhouse-search" in run
+            and "UNTRUSTED DATA" in run,
+        )
+        check(
+            "workflow: search prompt names related and superseding targets",
+            "related, duplicate, or superseding PRs/issues" in run
+            and "cross-reference them in your verdict" in run,
+        )
+        check(
+            "workflow: search prompt keeps the request-file contract",
+            "write a JSON request to \\`search-request.json\\`, then run" in run
+            and "exactly \\`wheelhouse-search\\`" in run,
+        )
+        check(
+            "workflow: search prompt narrows model writes",
+            "Do not write any other file" in run
+            and "never attempt a code change or act operation" in run,
+        )
+        check(
+            "workflow: final prompt keeps the search write exception",
+            "Do not write files other than search-request.json" in run
+            and "Do not write files, modify code" in run,
+        )
+
+    check("workflow: read-only search wrapper install step exists", install is not None)
+    if install:
+        env = install.get("env", {})
+        check(
+            "workflow: search wrapper receives owner scope",
+            env.get("GITHUB_REPOSITORY_OWNER") == "${{ github.repository_owner }}",
+        )
+        check(
+            "workflow: search wrapper receives resolved target repo slug",
+            env.get("TARGET_REPO") == "${{ steps.resolve.outputs.slug }}",
+        )
+        check(
+            "workflow: search wrapper installs from the trusted checkout",
+            str(install.get("run", "")).strip()
+            == "python scripts/nl_readonly_search.py install",
+        )
+        check(
+            "workflow: search wrapper runs only when readonly search is enabled",
+            "steps.readonly.outputs.enabled == 'true'" in str(install.get("if", "")),
+        )
+
+    readonly_i = step_index(steps, lambda s: s.get("id") == "readonly")
+    prompt_i = step_index(steps, lambda s: s.get("id") == "prepare")
+    install_i = step_index(steps, lambda s: s.get("id") == "search-tool")
+    search_i = step_index(steps, lambda s: s.get("id") == "claude_search")
+    check(
+        "workflow: readonly gate runs before prompt construction",
+        None not in (readonly_i, prompt_i) and readonly_i < prompt_i,
+    )
+    check(
+        "workflow: search wrapper installs before Claude can use it",
+        None not in (install_i, search_i) and install_i < search_i,
+    )
+    check(
+        "workflow: read-only search and legacy Claude branches both exist",
+        search is not None and legacy is not None,
+    )
+
+
 def test_workflow_dispatch_gate_restricts_bot_reruns():
     doc = load_yaml(".github", "workflows", "deep-review.yml")
     gate = str(doc["jobs"]["deep-review"].get("if", ""))
@@ -223,18 +334,21 @@ def test_code_grounded_checkout_and_tool_isolation():
             w.get("persist-credentials") is False,
         )
 
-    claude = next(
-        (s for s in steps if "claude-code-action" in str(s.get("uses", ""))), None
-    )
-    check("workflow: a Claude step exists", claude is not None)
-    if claude:
+    llm_steps = claude_steps(steps)
+    legacy = step_by_id(steps, "claude")
+    search = step_by_id(steps, "claude_search")
+    check("workflow: two mutually exclusive Claude steps exist", len(llm_steps) == 2)
+    check("workflow: legacy no-search Claude step exists", legacy is not None)
+    check("workflow: read-only search Claude step exists", search is not None)
+
+    for claude in llm_steps:
         dumped = yaml.safe_dump(claude)
         check(
             "workflow: Claude action is pinned to the reviewed v1 commit",
             str(claude.get("uses", "")) == CLAUDE_ACTION_PIN,
         )
         check(
-            "security: the Claude step NEVER receives FLEET_TOKEN",
+            "security: no Claude step receives FLEET_TOKEN",
             "FLEET_TOKEN" not in dumped,
         )
         check(
@@ -245,16 +359,76 @@ def test_code_grounded_checkout_and_tool_isolation():
             "security: Claude action does NOT allow arbitrary bots",
             str((claude.get("with") or {}).get("allowed_bots", "")).strip() != "*",
         )
-        args = str((claude.get("with") or {}).get("claude_args", ""))
+
+    if legacy:
+        dumped = yaml.safe_dump(legacy)
+        args = str((legacy.get("with") or {}).get("claude_args", "")).strip()
         check(
-            "security: Claude is restricted to read-only exploration only",
+            "security: legacy Claude is the byte-for-byte no-search tool mode",
+            args == "--allowedTools Read,Grep,Glob\n--max-turns 30",
+        )
+        check(
+            "security: legacy Claude has no GH_TOKEN env",
+            "env" not in legacy or "GH_TOKEN" not in (legacy.get("env") or {}),
+        )
+        check(
+            "security: legacy Claude keeps the default action github_token",
+            (legacy.get("with") or {}).get("github_token") == "${{ github.token }}",
+        )
+        check(
+            "security: legacy Claude never receives FLEET_TOKEN or READONLY_TOKEN",
+            "FLEET_TOKEN" not in dumped and "READONLY_TOKEN" not in dumped,
+        )
+        check(
+            "security: legacy Claude is NOT granted Bash / shell execution",
+            "Bash" not in args,
+        )
+        check(
+            "security: legacy Claude is NOT granted Write",
+            "Write" not in args,
+        )
+        check(
+            "security: legacy Claude runs only when readonly search is disabled",
+            "steps.readonly.outputs.enabled != 'true'" in str(legacy.get("if", "")),
+        )
+
+    if search:
+        dumped = yaml.safe_dump(search)
+        env = search.get("env", {})
+        args = str((search.get("with") or {}).get("claude_args", ""))
+        check(
+            "security: search Claude exposes READONLY_TOKEN as GH_TOKEN",
+            env.get("GH_TOKEN") == "${{ secrets.READONLY_TOKEN }}",
+        )
+        check(
+            "security: search Claude uses READONLY_TOKEN as action github_token",
+            (search.get("with") or {}).get("github_token")
+            == "${{ secrets.READONLY_TOKEN }}",
+        )
+        check(
+            "security: search Claude does not receive the default write token",
+            "${{ github.token }}" not in dumped,
+        )
+        check(
+            "security: search Claude runs only when readonly search is enabled",
+            "steps.readonly.outputs.enabled == 'true'" in str(search.get("if", "")),
+        )
+        check(
+            "security: search Claude has Write for request-file search",
             "--allowedTools" in args
-            and "Read,Grep,Glob" in args
-            and "Write" not in args,
+            and "Read,Grep,Glob,Write,Bash(wheelhouse-search)" in args
+            and "Write" in args
+            and "Bash(wheelhouse-search)" in args
         )
-        check(
-            "security: Claude is NOT granted Bash / shell execution", "Bash" not in args
-        )
+        for forbidden in (
+            "Bash(gh",
+            "Bash(git",
+            "Bash(wheelhouse-search *)",
+            "gh pr merge",
+            "gh issue close",
+            "gh workflow run",
+        ):
+            check("security: search Claude forbids %s" % forbidden, forbidden not in args)
 
     # The verdict is posted by the workflow (default token), not by Claude.
     dr = read(".github", "workflows", "deep-review.yml")
@@ -275,8 +449,10 @@ def test_code_grounded_checkout_and_tool_isolation():
             "github.token" in env and "FLEET_TOKEN" not in yaml.safe_dump(post),
         )
         check(
-            "workflow: post step captures the Claude action execution_file output",
-            "EXECUTION_FILE" in env and "steps.claude.outputs.execution_file" in env,
+            "workflow: post step captures either Claude action execution_file output",
+            "EXECUTION_FILE" in env
+            and "steps.claude_search.outputs.execution_file" in env
+            and "steps.claude.outputs.execution_file" in env,
         )
         check(
             "workflow: post step extracts the clean final result event",
@@ -605,6 +781,7 @@ def main():
     test_investigate_rendered_per_kind()
     test_enable_flag_removed()
     test_token_absent_message()
+    test_readonly_search_wiring()
     test_workflow_dispatch_gate_restricts_bot_reruns()
     test_code_grounded_checkout_and_tool_isolation()
     test_prompt_treats_card_body_as_untrusted_data()

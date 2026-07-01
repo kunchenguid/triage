@@ -73,7 +73,7 @@ still appears where it's plain English, e.g. "triage the queue".)
   `execute`; the NON-CONSUMING `investigate` routing + `clear-checkbox`; plus the
   natural-language `nl-eligible`/`nl-prompt`/`nl-route` that map an owner's
   free-text comment to a structured result), `nl_readonly_search.py` (installs
-  the optional `wheelhouse-search` wrapper for READONLY_TOKEN-backed answer
+  the optional `wheelhouse-search` wrapper for READONLY_TOKEN-backed LLM
   context),
   `build_item.py` (normalize ingest payload), `reconcile.py` (backstop
   create/**refresh**/close). `apply_decision` imports `wheelhouse_core` and
@@ -331,7 +331,12 @@ data; the LLM never gets `FLEET_TOKEN`):
 
 - **`deep-review.yml` - ALWAYS-ON, code-grounded (no enable flag).** Triggered by ticking the **Investigate** box on a card, by the repo owner applying the `needs-deep-review` label, or by the repo owner running `workflow_dispatch` with only `issue=...` for direct verification.
   Bot-dispatched Investigate runs use the immutable target inputs passed by `decision-handler.yml`; owner issue-only runs and manual label runs parse the current card body with `github.token`.
-  It checks out the TARGET's code read-only (`FLEET_TOKEN`, `persist-credentials: false`, the PR head for a review card / the default branch for an issue card) and runs Claude restricted to `--allowedTools Read,Grep,Glob` over that checkout - so it traces real code paths, never just the diff, and can NEVER write files or execute the target's code (no Bash, no build/test).
+  It checks out the TARGET's code read-only (`FLEET_TOKEN`, `persist-credentials: false`, the PR head for a review card / the default branch for an issue card) and runs Claude restricted to `--allowedTools Read,Grep,Glob` over that checkout when search is disabled - so it traces real code paths, never just the diff, and can NEVER execute the target's code.
+  When `READONLY_TOKEN` is absent, this remains the legacy no-search path: no shell `GH_TOKEN`, no Bash tool, and `github_token: github.token`.
+  When `READONLY_TOKEN` is present, Claude also uses that read-only public-scoped token as both the action `github_token` input and shell `GH_TOKEN`, plus `Write` for `search-request.json` and `Bash(wheelhouse-search)`.
+  The wrapper is still the existing `scripts/nl_readonly_search.py` install path, scoped to the target repo plus configured fleet repos, so deep-review can cross-reference related, duplicate, or superseding PRs/issues and code context.
+  Search output is UNTRUSTED DATA and advisory evidence only; the model still produces only verdict text, and `FLEET_TOKEN` never reaches it.
+  No deterministic downstream step reads model-written files because verdict capture uses the action `execution_file` result event.
   Claude does not write a verdict file.
   The Claude action allows only `github-actions[bot]` as a bot actor so the maintainer-gated Investigate dispatch can pass; it must not allow `*` or any external bot actor.
   Its final response is captured from the action's `execution_file` output by preferring the clean `type: "result"` event's `result` string, falling back to the last assistant text, and the trusted workflow step posts that text as a card comment with `github.token`.
@@ -352,9 +357,9 @@ data; the LLM never gets `FLEET_TOKEN`):
   duplicate, or superseding PRs/issues and code context.
   The prompt carries the card's prior thread as owner-scoped conversation history
   so follow-up questions keep continuity (see the conversation-memory bullet in
-  Sharp edges for the trusted-author rule). The same read-only search capability
-  can be extended to `deep-review.yml` later, but it is intentionally scoped to
-  `nl_decisions` only here.
+  Sharp edges for the trusted-author rule).
+  Deep-review uses the same wrapper under the same optional `READONLY_TOKEN`
+  trust model, but only for advisory verdict context.
 
 ## Validation
 
@@ -373,14 +378,16 @@ verdict, `pull_request_target` posture detection, and the auto-approve-vs-card r
 CI approval, and issue triage, no network, and
 `python tests/test_deep_review.py` - the always-on/code-grounded deep-review +
 Investigate wiring: render options, the removed enable flag, the token-absent
-note, the `persist-credentials: false` checkout + read-only tool isolation, the
-narrow `allowed_bots`, the action-output verdict capture, issue-only manual
-dispatch, and the handler's immutable-input `workflow_dispatch` trigger, all by
-inspecting the scripts/YAML, no network), and
+note, the `persist-credentials: false` checkout + tool isolation, the
+narrow `allowed_bots`, the optional READONLY_TOKEN-gated `wheelhouse-search`
+wiring, the action-output verdict capture, issue-only manual dispatch, and the
+handler's immutable-input `workflow_dispatch` trigger, all by inspecting the
+scripts/YAML, no network), and
 YAML-parse `.github/workflows/*.yml` + `wheelhouse.config.yml` +
 `.github/ISSUE_TEMPLATE/*.yml` (run `actionlint` if available; fetch the binary
 via its `download-actionlint.bash` if not). The live LLM paths (deep-review,
 nl_decisions) can only be exercised end-to-end in CI with the token set (and, for
 nl_decisions, the flag on). Secrets the maintainer must add: `FLEET_TOKEN`
 (always), `CLAUDE_CODE_OAUTH_TOKEN` (for deep-review and/or nl_decisions), and
-optionally `READONLY_TOKEN` (public-read only, for nl_decisions search).
+optionally `READONLY_TOKEN` (public-read only, for nl_decisions and deep-review
+search).
