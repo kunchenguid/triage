@@ -96,7 +96,7 @@ jobs:
       # --- Natural-language path (opt-in) ------------------------------------
       # An owner comment that is NOT a slash-command. Gated on nl_decisions in
       # config AND the CLAUDE_CODE_OAUTH_TOKEN secret; inert otherwise. Claude
-      # only MAPS intent to a structured result - the deterministic steps below
+      # only MAPS intent or answers a question - the deterministic steps below
       # do any acting, so every guard still applies.
       - id: nl-gate
         if: ${{ steps.gate.outputs.authorized == 'true' && github.event_name == 'issue_comment' && steps.decide.outputs.decision == '' }}
@@ -173,6 +173,22 @@ jobs:
             --jq '.[] | {id: .id, login: .user.login, body: .body}' \
             > card_comments.json || : > card_comments.json
 
+      # Optional read-only model search. READONLY_TOKEN is a public-read token
+      # that may be safely handed to Claude for context gathering. If the secret
+      # is absent, the prompt and Claude tool list stay in the legacy no-search
+      # mode.
+      - id: nl-readonly
+        if: steps.nl-gate.outputs.proceed == 'true'
+        env:
+          HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
+        run: |
+          echo "enabled=$HAS_READONLY_TOKEN" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_READONLY_TOKEN" = "true" ]; then
+            echo "nl readonly search enabled"
+          else
+            echo "nl readonly search disabled (READONLY_TOKEN absent)"
+          fi
+
       - id: nl-prompt
         if: steps.nl-gate.outputs.proceed == 'true'
         env:
@@ -183,17 +199,37 @@ jobs:
           TARGET_FILE: target.txt
           COMMENTS_FILE: card_comments.json
           TRIGGER_COMMENT_ID: ${{ github.event.comment.id }}
+          READONLY_SEARCH_ENABLED: ${{ steps.nl-readonly.outputs.enabled }}
         run: python scripts/apply_decision.py nl-prompt
 
-      # Claude maps intent -> writes decision.json. It is restricted to the
-      # Write tool (no Bash/gh, cannot run commands) and gets only this repo's
-      # token, never FLEET_TOKEN. Auth is the Claude subscription token, NOT an
-      # API key.
+      # Claude maps intent -> writes decision.json. If READONLY_TOKEN exists,
+      # this branch may also run read-only gh/git shell commands for answer
+      # context. The action's github_token input is READONLY_TOKEN here because
+      # claude-code-action also exposes that input to the Claude subprocess as
+      # GitHub CLI credentials. GH_TOKEN is READONLY_TOKEN, never FLEET_TOKEN,
+      # and any resulting output is treated by the prompt as UNTRUSTED DATA.
+      # Auth is the Claude subscription token, NOT an API key.
       #
       # NOTE: pin a specific release of this action when you turn nl_decisions on
       # (see deep-review.yml for the same convention).
+      - name: Claude interprets intent (read-only search)
+        if: ${{ steps.nl-gate.outputs.proceed == 'true' && steps.nl-readonly.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.READONLY_TOKEN }}
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.READONLY_TOKEN }}
+          prompt: ${{ steps.nl-prompt.outputs.prompt }}
+          claude_args: |
+            --allowedTools "Write,Bash(gh pr list *),Bash(gh pr view *),Bash(gh pr diff *),Bash(gh issue list *),Bash(gh issue view *),Bash(gh search *),Bash(gh api repos/*),Bash(gh api /repos/*),Bash(gh api search/*),Bash(gh api /search/*),Bash(git clone https://github.com/*),Bash(git log *),Bash(git show *),Bash(git grep *),Bash(git -C * log *),Bash(git -C * show *),Bash(git -C * grep *)"
+            --max-turns 6
+
+      # Legacy no-search branch. This is the exact old tool posture: Write only,
+      # no shell, and no GH_TOKEN environment. It runs whenever READONLY_TOKEN is
+      # absent so the feature can ship before the optional secret exists.
       - name: Claude interprets intent
-        if: steps.nl-gate.outputs.proceed == 'true'
+        if: ${{ steps.nl-gate.outputs.proceed == 'true' && steps.nl-readonly.outputs.enabled != 'true' }}
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
