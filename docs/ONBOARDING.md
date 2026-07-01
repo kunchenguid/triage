@@ -3,7 +3,7 @@
 The scheduled `scan-backstop` already finds and refreshes items in your fleet hourly with **no** changes to your other repos.
 This doc is the optional **fast path**: add a tiny dispatch workflow to a source repo so events show up or refresh in your queue in real time instead of waiting for the next hourly scan.
 
-Nothing here is required to run the machine, and nothing here changes how Wheelhouse classifies items - a dispatch is just a low-latency nudge that creates a card or refreshes a pure pending card when material state has changed; the backstop still reconciles everything later.
+Nothing here is required to run the machine, and nothing here changes how Wheelhouse classifies items - a dispatch is just a low-latency nudge that creates a card or refreshes a pure pending card when material state has changed or when Wheelhouse's internal card render version is stale; the backstop still reconciles everything later.
 The scheduled scan applies Wheelhouse's owner/maintainer/bot author filter, but this explicit dispatch path trusts the source workflow and does not re-check author type, so only dispatch items you want carded.
 The scheduled scan also applies merge-conflict `needs-rebase` routing and rebase nudges; explicit dispatches do not, so the backstop may later consume a dispatched PR-review card for a PR GitHub reports as `CONFLICTING`.
 For PR-review cards, ingest can also queue the automatic lightweight triage side job after the card is created or refreshed, using the same config and token gates as the scheduled scan.
@@ -44,8 +44,9 @@ Default checkbox sets are `pr-review`: `merge,close,investigate,hold`; `ci-appro
 If you override `options`, include `investigate` only on `pr-review` or `issue-triage` cards when you want that box.
 
 The hub's `ingest` workflow dedupes by target: a second dispatch for the same `repo`+`number` creates nothing new.
-If the existing card is still a pure `needs-decision` card and a material field changed (`head_sha`, `comp`, `tests`, `kind`, `priority`, or `options`), the hub refreshes it in place.
-Title, summary, and recommendation updates ride along with a material refresh, but do not rewrite an existing card by themselves.
+If the existing card is still a pure `needs-decision` card and a material field changed (`head_sha`, `comp`, `tests`, `kind`, `priority`, or `options`) or its stored card render version is stale, the hub refreshes it in place.
+The render-version trigger is internal and self-terminating; source repos do not send it.
+Title, summary, and recommendation updates ride along with a material or render-version refresh, but do not rewrite an existing card by themselves.
 Cards already labeled `processing`, `resolved`, or `blocked` are left untouched so a refresh cannot clobber an in-flight or consumed decision.
 When auto triage is eligible, the hub writes `triaged_sha` for the current head before dispatching `triage.yml`, so a failed or timed-out run is still the only attempt for that PR head SHA.
 
@@ -134,7 +135,7 @@ You can exercise the whole path without touching a source repo:
 
 1. In the hub, **Actions** ▸ **ingest** ▸ **Run workflow**.
 2. Fill in `repo`, `number`, and (recommended) `head_sha`.
-3. A decision card appears in the hub's issues; if one already exists, material changes refresh it in place.
+3. A decision card appears in the hub's issues; if one already exists, material changes or a stale card render version refresh it in place.
 4. Tick a consuming decision box to confirm the handler acts on the target.
 
 This is the quickest way to validate `FLEET_TOKEN` scope before wiring real dispatches.

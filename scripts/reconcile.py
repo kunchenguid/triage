@@ -28,6 +28,7 @@ Usage:
 
 cards.json is `gh issue list --state open --json number,body,labels,title`.
 """
+
 import json
 import os
 import sys
@@ -71,18 +72,24 @@ def maybe_queue_auto_triage(item, row, has_token):
     """
     if not row:
         return False
-    if not render_card.should_auto_triage(item, row.get("state"), row.get("labels"), has_token):
+    if not render_card.should_auto_triage(
+        item, row.get("state"), row.get("labels"), has_token
+    ):
         return False
     try:
         if not render_card.mark_triage_queued(row["number"], item, row.get("body", "")):
             return False
         render_card.dispatch_triage_workflow(row["number"], item)
-        print("queued auto triage for %s#%s on card #%s"
-              % (item["repo"], item["number"], row["number"]))
+        print(
+            "queued auto triage for %s#%s on card #%s"
+            % (item["repo"], item["number"], row["number"])
+        )
         return True
     except Exception as e:
-        print("::warning::failed to queue auto triage for card #%s (%s#%s): %s"
-              % (row.get("number"), item.get("repo"), item.get("number"), str(e)[:160]))
+        print(
+            "::warning::failed to queue auto triage for card #%s (%s#%s): %s"
+            % (row.get("number"), item.get("repo"), item.get("number"), str(e)[:160])
+        )
         return False
 
 
@@ -96,8 +103,8 @@ def main():
     items = scan.get("items", [])
 
     # Index existing open cards by their target (repo, number) from the state block.
-    existing = {}            # (repo, number) -> existing card row
-    cards_with_state = []    # existing card rows with parsed state
+    existing = {}  # (repo, number) -> existing card row
+    cards_with_state = []  # existing card rows with parsed state
     for card in cards:
         state = core.parse_state_block(card.get("body", ""))
         if not state:
@@ -115,9 +122,10 @@ def main():
     worklist_keys = {(item["repo"], int(item["number"])) for item in items}
 
     # 1) For each scanned worklist item, create a card if none exists, else
-    #    refresh it in place when its target materially changed. Items only come
-    #    from ok:true repos (build_repo returns no items for a failed scan), so
-    #    this path never refreshes a card for a repo whose state is unknown.
+    #    refresh it in place when its target materially changed or its card
+    #    render_version is stale. Items only come from ok:true repos (build_repo
+    #    returns no items for a failed scan), so this path never refreshes a card
+    #    for a repo whose state is unknown.
     created = 0
     refreshed = 0
     triage_queued = 0
@@ -133,27 +141,42 @@ def main():
                 found = render_card.find_card(render_card.marker_label(item))
                 current_for_triage = current_card(found) if found else None
             except Exception as e:  # one bad item must not abort the whole pass
-                print("::warning::failed to create card for %s#%s: %s"
-                      % (item["repo"], item["number"], str(e)[:160]))
+                print(
+                    "::warning::failed to create card for %s#%s: %s"
+                    % (item["repo"], item["number"], str(e)[:160])
+                )
             if maybe_queue_auto_triage(item, current_for_triage, has_triage_token):
                 triage_queued += 1
             continue
         # Card exists: refresh only a pure needs-decision card whose target
-        # materially changed. A card mid-decision (processing/resolved/blocked)
-        # or with no material change is left completely untouched (no edit, no
-        # comment). `upsert_card` re-checks both guards before it edits.
-        if render_card.is_refreshable(ex["labels"]) and render_card.material_changed(item, ex["state"]):
+        # materially changed OR whose stored render_version is behind current
+        # (a one-time, self-terminating re-render for display-only fixes, e.g.
+        # dropping the author @mention). A card mid-decision
+        # (processing/resolved/blocked) or with neither trigger is left
+        # completely untouched (no edit, no comment). `upsert_card` re-checks
+        # both guards before it edits.
+        if render_card.is_refreshable(ex["labels"]) and (
+            render_card.material_changed(item, ex["state"])
+            or render_card.render_stale(ex["state"])
+        ):
             try:
                 current = current_card(ex)
                 current_for_triage = current
-                if current is not None and render_card.is_refreshable(current["labels"]):
-                    if render_card.material_changed(item, current["state"]):
+                if current is not None and render_card.is_refreshable(
+                    current["labels"]
+                ):
+                    still_stale = render_card.material_changed(
+                        item, current["state"]
+                    ) or render_card.render_stale(current["state"])
+                    if still_stale:
                         render_card.upsert_card(item, existing=current)
                         refreshed += 1
                         current_for_triage = current_card(current)
             except Exception as e:
-                print("::warning::failed to refresh card #%s for %s#%s: %s"
-                      % (ex["number"], item["repo"], item["number"], str(e)[:160]))
+                print(
+                    "::warning::failed to refresh card #%s for %s#%s: %s"
+                    % (ex["number"], item["repo"], item["number"], str(e)[:160])
+                )
         if current_for_triage is None and render_card.should_auto_triage(
             item, ex["state"], ex["labels"], has_triage_token
         ):
@@ -176,8 +199,11 @@ def main():
             continue
         number = int(state.get("number", 0))
         kind = state.get("kind", "pr-review")
-        open_set = set(r.get("open_pr_numbers", []) if kind in PR_KINDS
-                       else r.get("open_issue_numbers", []))
+        open_set = set(
+            r.get("open_pr_numbers", [])
+            if kind in PR_KINDS
+            else r.get("open_issue_numbers", [])
+        )
         if number in open_set:
             key = (repo, number)
             if key in worklist_keys or not render_card.is_refreshable(ex["labels"]):
@@ -192,27 +218,38 @@ def main():
             r = repos.get(repo)
             if not r or not r.get("ok"):
                 continue
-            open_set = set(r.get("open_pr_numbers", []) if kind in PR_KINDS
-                           else r.get("open_issue_numbers", []))
+            open_set = set(
+                r.get("open_pr_numbers", [])
+                if kind in PR_KINDS
+                else r.get("open_issue_numbers", [])
+            )
             current_key = (repo, number)
             if number not in open_set or current_key in worklist_keys:
                 continue
             if not render_card.is_refreshable(current["labels"]):
                 continue
-            msg = ("Self-healed by the scheduled backstop: %s#%s no longer needs "
-                   "a maintainer decision in the current scan - consuming this "
-                   "card." % (repo, number))
+            msg = (
+                "Self-healed by the scheduled backstop: %s#%s no longer needs "
+                "a maintainer decision in the current scan - consuming this "
+                "card." % (repo, number)
+            )
         else:
-            msg = ("Self-healed by the scheduled backstop: %s#%s is no longer open "
-                   "(merged/closed) - consuming this card." % (repo, number))
+            msg = (
+                "Self-healed by the scheduled backstop: %s#%s is no longer open "
+                "(merged/closed) - consuming this card." % (repo, number)
+            )
         try:
             render_card.close_card(card_number, msg)
             closed += 1
         except Exception as e:
-            print("::warning::failed to close card #%s: %s" % (card_number, str(e)[:160]))
+            print(
+                "::warning::failed to close card #%s: %s" % (card_number, str(e)[:160])
+            )
 
-    print("reconcile: %d card(s) created, %d refreshed, %d auto-triage queued, %d card(s) closed"
-          % (created, refreshed, triage_queued, closed))
+    print(
+        "reconcile: %d card(s) created, %d refreshed, %d auto-triage queued, %d card(s) closed"
+        % (created, refreshed, triage_queued, closed)
+    )
 
 
 if __name__ == "__main__":
