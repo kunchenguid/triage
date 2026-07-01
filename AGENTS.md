@@ -40,7 +40,10 @@ still appears where it's plain English, e.g. "triage the queue".)
   deterministically decide "did this target materially change?" - see "Card
   refresh" in Sharp edges). `options` is also material for refresh comparison,
   but is normalized as a sorted set so checkbox reordering alone does not
-  refresh the card. `render_card.py` writes that marker, but
+  refresh the card. Automatic PR triage adds non-material cache fields such as
+  `triaged_sha` and `triage_status`; those are deliberately outside
+  `MATERIAL_FIELDS` so a triage result never changes classification or forces a
+  card refresh. `render_card.py` writes that marker, but
   `parse_state_block` also accepts the legacy `<!-- triage-state: ... -->`
   marker (cards rendered before the rename) - back-compat that must stay so a live
   queue keeps working. It also tolerates old `wheelhouse-state` cards that lack
@@ -53,7 +56,10 @@ still appears where it's plain English, e.g. "triage the queue".)
   (tick/slash/**plain-English** -> act on target -> consume card), `scan-backstop`
   (hourly scan -> reconcile: create/refresh/close - the primary keep-current path
   now that cards refresh on material change; safe to run hourly because reconcile
-  is a full no-op when nothing changed), `deep-review` (ALWAYS-ON, code-grounded;
+  is a full no-op when nothing changed, and queues automatic PR triage when the
+  current head lacks a fresh `triaged_sha` cache), `triage` (automatic,
+  lightweight, advisory PR-card context; gated on `auto_triage` and
+  `CLAUDE_CODE_OAUTH_TOKEN`; cached once per PR head), `deep-review` (ALWAYS-ON, code-grounded;
   gated only on `CLAUDE_CODE_OAUTH_TOKEN` - no config flag),
   `no-mistakes-required` (PR-to-`main` gate: the job `name:` MUST stay exactly
   `PR must be raised via no-mistakes` - it is the check name the fleet convention
@@ -66,17 +72,19 @@ still appears where it's plain English, e.g. "triage the queue".)
 - **Scripts:** `wheelhouse_core.py` (scan/classify/dedup/security gate + the
   shared CI-safety verdict `ci_safety` / `repo_pr_target_posture` and scan-time
   auto-approve in `build_repo`, plus shared utils
-  `parse_state_block`, `authorized`, `state`, `nl-decisions-enabled`),
+  `parse_state_block`, `authorized`, `state`, `nl-decisions-enabled`,
+  `auto-triage-enabled`),
   `render_card.py` (render + card CRUD; `CHECKBOX_OPTIONS`/`OPTION_LABELS` carry
   the per-kind checkboxes, including the non-consuming `investigate` box on
-  pr-review/issue-triage), `apply_decision.py` (deterministic `parse` then
+  pr-review/issue-triage; automatic triage section rendering, `triaged_sha`
+  cache updates, and trusted triage-result card edits), `apply_decision.py` (deterministic `parse` then
   `execute`; the NON-CONSUMING `investigate` routing + `clear-checkbox`; plus the
   natural-language `nl-eligible`/`nl-prompt`/`nl-route` that map an owner's
   free-text comment to a structured result), `nl_readonly_search.py` (installs
   the optional `wheelhouse-search` wrapper for READONLY_TOKEN-backed LLM
   context),
   `build_item.py` (normalize ingest payload), `reconcile.py` (backstop
-  create/**refresh**/close). `apply_decision` imports `wheelhouse_core` and
+  create/**refresh**/close and automatic triage dispatch). `apply_decision` imports `wheelhouse_core` and
   `nl_readonly_search`; `reconcile`/`render_card` import `wheelhouse_core` (and
   `build_item` imports `render_card`) via
   `sys.path.insert(0, dirname(__file__))`.
@@ -143,6 +151,25 @@ still appears where it's plain English, e.g. "triage the queue".)
   scanned `items`, which exist solely for `ok:true` repos, so an `ok:false` repo
   (state unknown) is never refreshed - the same invariant that bars closing its
   cards.
+- **Automatic PR triage is a cached card-side side job, not routing.**
+  It applies only to pure `needs-decision` pr-review cards when the effective
+  `auto_triage` setting is true and `CLAUDE_CODE_OAUTH_TOKEN` is present.
+  The cache key is the card state's `triaged_sha`, compared to the current
+  `head_sha`.
+  Missing `triaged_sha` on an existing open card counts as stale, so legacy
+  pr-review cards backfill exactly once on the next eligible scan.
+  Before dispatching `triage.yml`, `reconcile.py` / the ingest fast path edits
+  the card state to set `triaged_sha=<current head>` and
+  `triage_status=queued`; this intentionally spends at most one Claude attempt
+  per head even if the asynchronous workflow errors, times out, or cannot parse
+  a result.
+  `triaged_sha` and the visible `### Triage` section are non-material: they must
+  never affect `classify`, `material_changed`, decision parsing, merge execution,
+  fork-CI approval, author filtering, or conflict routing.
+  If `head_sha` changes, normal material refresh removes stale triage context and
+  the fresh head becomes eligible for one new triage attempt.
+  If config is off or the token is absent, no dispatch happens and cards render
+  exactly as the deterministic card did before this feature.
 - Natural-language decisions are owner-comment-only and structured: the LLM
   returns `{mode: action|answer|clarify, action?, free_text?, answer?}` to
   `decision.json` and nothing else. `apply_decision.py nl-route` is the trust
@@ -167,7 +194,7 @@ still appears where it's plain English, e.g. "triage the queue".)
   `decision.json` into runner temp, then runs `nl-route` and `execute` from a
   read-only trusted source copy with a scrubbed environment.
 - Token discipline per step: scan/execute and the read-only target reads for the
-  LLM (`deep-review` prepare + its target-code checkout, decision-handler
+  LLM (`triage` prepare + target-code checkout, `deep-review` prepare + its target-code checkout, decision-handler
   `nl-fetch`) use `FLEET_TOKEN`; all
   card writes - including every `issue-ops/labeler` step (its `github_token`
   defaults to `github.token`, passed explicitly here) - use `github.token`. The
@@ -178,7 +205,7 @@ still appears where it's plain English, e.g. "triage the queue".)
   shell tools, and with `READONLY_TOKEN` it only gets that read credential as the
   action `github_token` input and shell `GH_TOKEN` for context search through
   `wheelhouse-search`. Target content and any search output reach it only as
-  delimited untrusted data inside the prompt, OR (for deep-review) as code
+  delimited untrusted data inside the prompt, OR (for triage/deep-review) as code
   already on disk from a
   `persist-credentials: false` checkout, so NO acting token is left on disk for
   the LLM to read.
@@ -336,7 +363,7 @@ still appears where it's plain English, e.g. "triage the queue".)
 
 ## LLM side-jobs
 
-Two independent LLM features share the same auth (a Claude **subscription** token
+Three independent LLM features share the same auth (a Claude **subscription** token
 from `claude setup-token` via `anthropics/claude-code-action` - NOT an Anthropic
 API key) and the same injection model (only owner-authored text is an
 instruction; target content and optional search output are delimited untrusted
@@ -344,6 +371,15 @@ data; the LLM never gets `FLEET_TOKEN`):
 Every `anthropics/claude-code-action` LLM step is pinned to `v1.0.161` at commit `fad22eb3fa582b7357fc0ea48af6645851b884fd` and passes `--model sonnet`.
 The pinned release resolves `@anthropic-ai/claude-agent-sdk` to `0.3.197`; on the Anthropic API, Claude Code versions v2.1.197 and later resolve `sonnet` to Sonnet 5.
 
+- **`triage.yml` - automatic, lightweight, advisory PR-card context.** Triggered by `scan-backstop` / `reconcile.py` and the ingest fast path for pure `needs-decision` pr-review cards whose current `head_sha` does not match `triaged_sha`.
+  It is opt-out through `auto_triage` (global default true, per-repo override allowed) and inert unless `CLAUDE_CODE_OAUTH_TOKEN` is present.
+  It checks out the target PR head read-only with `FLEET_TOKEN`, `persist-credentials: false`, then runs Claude with lower `--max-turns` than deep-review to produce only structured `{summary, product_implications, recommended_next_step}` context.
+  It writes the visible `### Triage` section by a trusted workflow step with `github.token`, never by Claude, and the result is advisory only.
+  It never changes classification, labels, checkbox decisions, `apply_decision.py`, merge/close/approve behavior, fork-CI safety, author filtering, or conflict routing.
+  Before dispatch, the queueing path writes `triaged_sha=<head_sha>` and `triage_status=queued`, so errors and timeouts fail open without retriggering the same head on every scan.
+  Existing open pr-review cards with no `triaged_sha` are intentionally stale and backfill once on the next eligible scan.
+  Optional `READONLY_TOKEN` search uses the unchanged `wheelhouse-search` wrapper and remains untrusted evidence only.
+  The Claude action allows only `github-actions[bot]`, never `*`, because scan/ingest dispatches use `github.token`.
 - **`deep-review.yml` - ALWAYS-ON, code-grounded (no enable flag).** Triggered by ticking the **Investigate** box on a card, by the repo owner applying the `needs-deep-review` label, or by the repo owner running `workflow_dispatch` with only `issue=...` for direct verification.
   Bot-dispatched Investigate runs use the immutable target inputs passed by `decision-handler.yml`; owner issue-only runs and manual label runs parse the current card body with `github.token`.
   It checks out the TARGET's code read-only (`FLEET_TOKEN`, `persist-credentials: false`, the PR head for a review card / the default branch for an issue card) and runs Claude restricted to `--allowedTools Read,Grep,Glob` over that checkout when search is disabled - so it traces real code paths, never just the diff, and can NEVER execute the target's code.
@@ -395,8 +431,9 @@ Run the unit tests:
 - `python tests/test_merge_conflict.py` - mergeability fail-open vs CONFLICTING routing, idempotent rebase nudges, author-filter nudge skips, and reconcile self-healing for conflicted PR cards, no network.
 - `python tests/test_ci_autoapprove.py` - the shared `ci_safety` verdict, `pull_request_target` posture detection, and the auto-approve-vs-card routing plus scan-log observability in `build_repo`, all with the network-touching helpers stubbed.
 - `python tests/test_author_filter.py` - queue author filtering across PR review, CI approval, and issue triage, no network.
+- `python tests/test_auto_triage.py` - automatic PR-card triage config defaults/overrides, per-head cache and legacy-card backfill, rendered section/no-mention behavior, reconcile/ingest dispatch gates, and `triage.yml` token isolation, all offline.
 - `python tests/test_deep_review.py` - the always-on/code-grounded deep-review and Investigate wiring: render options, the removed enable flag, the token-absent note, the `persist-credentials: false` checkout plus read-only tool isolation, the narrow `allowed_bots`, the optional READONLY_TOKEN-gated `wheelhouse-search` wiring, the action-output verdict capture, issue-only manual dispatch, and the handler's immutable-input `workflow_dispatch` trigger, all by inspecting the scripts/YAML, no network.
 YAML-parse `.github/workflows/*.yml` plus `wheelhouse.config.yml` plus `.github/ISSUE_TEMPLATE/*.yml`.
 Run `actionlint` if available; fetch the binary via its `download-actionlint.bash` if not.
-The live LLM paths (deep-review, nl_decisions) can only be exercised end-to-end in CI with the token set and, for nl_decisions, the flag on.
-Secrets the maintainer must add: `FLEET_TOKEN` always, `CLAUDE_CODE_OAUTH_TOKEN` for deep-review and/or nl_decisions, and optionally `READONLY_TOKEN` public-read only for nl_decisions and deep-review search.
+The live LLM paths (auto triage, deep-review, nl_decisions) can only be exercised end-to-end in CI with the token set and, for nl_decisions, the flag on.
+Secrets the maintainer must add: `FLEET_TOKEN` always, `CLAUDE_CODE_OAUTH_TOKEN` for auto triage/deep-review and/or nl_decisions, and optionally `READONLY_TOKEN` public-read only for auto triage, nl_decisions, and deep-review search.
