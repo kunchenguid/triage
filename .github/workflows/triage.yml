@@ -154,6 +154,8 @@ jobs:
               reason = "card number no longer matches dispatch input"
           elif state.get("head_sha") != os.environ["INPUT_HEAD_SHA"]:
               reason = "card head no longer matches dispatch input"
+          elif not render_card.triage_queued_for_head(state, os.environ["INPUT_HEAD_SHA"]):
+              reason = "card is no longer queued for this auto-triage attempt"
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               if reason:

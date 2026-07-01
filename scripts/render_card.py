@@ -176,6 +176,14 @@ def triage_fresh(item, state):
     return bool(head_sha and (state or {}).get("triaged_sha") == head_sha)
 
 
+def triage_queued_for_head(state, head_sha):
+    return bool(
+        head_sha
+        and (state or {}).get("triaged_sha") == head_sha
+        and (state or {}).get("triage_status") == "queued"
+    )
+
+
 def should_auto_triage(item, state, labels, has_token=True):
     """Whether this card should queue the lightweight automatic PR triage."""
     if not has_token:

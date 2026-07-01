@@ -370,6 +370,34 @@ def test_should_auto_triage_cache_and_gates():
     )
 
 
+def test_triage_queued_for_head_requires_matching_queued_attempt():
+    head = "abc1234def"
+    check(
+        "queued gate: matching queued attempt passes",
+        rc.triage_queued_for_head({"triaged_sha": head, "triage_status": "queued"}, head)
+        is True,
+    )
+    check(
+        "queued gate: succeeded attempt skips duplicate dispatch",
+        rc.triage_queued_for_head({"triaged_sha": head, "triage_status": "succeeded"}, head)
+        is False,
+    )
+    check(
+        "queued gate: errored attempt skips duplicate dispatch",
+        rc.triage_queued_for_head({"triaged_sha": head, "triage_status": "error"}, head)
+        is False,
+    )
+    check(
+        "queued gate: missing status skips dispatch",
+        rc.triage_queued_for_head({"triaged_sha": head}, head) is False,
+    )
+    check(
+        "queued gate: different head skips dispatch",
+        rc.triage_queued_for_head({"triaged_sha": "oldsha", "triage_status": "queued"}, head)
+        is False,
+    )
+
+
 def test_reconcile_backfills_legacy_card_without_material_change():
     it = item(auto_triage=True)
     calls = run_reconcile(scan_payload([it]), [card_row(it)])
@@ -463,6 +491,7 @@ def test_triage_workflow_security_wiring():
     steps = doc["jobs"]["triage"]["steps"]
     text = read(".github", "workflows", "triage.yml")
     trusted = step_by_id(steps, "trusted-src")
+    resolve = step_by_id(steps, "resolve")
     prepare = step_by_id(steps, "prepare")
     preserve = step_by_id(steps, "triage-result")
     update = step_by_name(steps, "Update the decision card")
@@ -508,6 +537,15 @@ def test_triage_workflow_security_wiring():
             'echo "path=$trusted"' in run
             and 'echo "python=$python_path"' in run
             and 'echo "safe_path=$safe_path"' in run,
+        )
+
+    check("workflow: resolve gate exists", resolve is not None)
+    if resolve:
+        run = str(resolve.get("run", ""))
+        check(
+            "workflow: duplicate dispatch requires queued status before Claude",
+            "triage_queued_for_head" in run
+            and "card is no longer queued for this auto-triage attempt" in run,
         )
 
     claude_steps = [s for s in steps if "claude-code-action" in str(s.get("uses", ""))]
@@ -694,6 +732,7 @@ def main():
     test_triage_requires_complete_structured_json()
     test_body_helpers_queue_and_apply_result()
     test_should_auto_triage_cache_and_gates()
+    test_triage_queued_for_head_requires_matching_queued_attempt()
     test_reconcile_backfills_legacy_card_without_material_change()
     test_reconcile_skips_when_fresh_token_absent_or_config_off()
     test_queue_triage_command_warns_on_dispatch_failure()
