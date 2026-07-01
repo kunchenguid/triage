@@ -331,11 +331,12 @@ data; the LLM never gets `FLEET_TOKEN`):
 
 - **`deep-review.yml` - ALWAYS-ON, code-grounded (no enable flag).** Triggered by ticking the **Investigate** box on a card, by the repo owner applying the `needs-deep-review` label, or by the repo owner running `workflow_dispatch` with only `issue=...` for direct verification.
   Bot-dispatched Investigate runs use the immutable target inputs passed by `decision-handler.yml`; owner issue-only runs and manual label runs parse the current card body with `github.token`.
-  It checks out the TARGET's code read-only (`FLEET_TOKEN`, `persist-credentials: false`, the PR head for a review card / the default branch for an issue card) and runs Claude restricted to `--allowedTools Read,Grep,Glob` over that checkout - so it traces real code paths, never just the diff, and can NEVER write files or execute the target's code.
+  It checks out the TARGET's code read-only (`FLEET_TOKEN`, `persist-credentials: false`, the PR head for a review card / the default branch for an issue card) and runs Claude restricted to `--allowedTools Read,Grep,Glob` over that checkout when search is disabled - so it traces real code paths, never just the diff, and can NEVER execute the target's code.
   When `READONLY_TOKEN` is absent, this remains the legacy no-search path: no shell `GH_TOKEN`, no Bash tool, and `github_token: github.token`.
-  When `READONLY_TOKEN` is present, Claude also uses that read-only public-scoped token as both the action `github_token` input and shell `GH_TOKEN`, plus `Bash(wheelhouse-search)`.
+  When `READONLY_TOKEN` is present, Claude also uses that read-only public-scoped token as both the action `github_token` input and shell `GH_TOKEN`, plus `Write` for `search-request.json` and `Bash(wheelhouse-search)`.
   The wrapper is still the existing `scripts/nl_readonly_search.py` install path, scoped to the target repo plus configured fleet repos, so deep-review can cross-reference related, duplicate, or superseding PRs/issues and code context.
   Search output is UNTRUSTED DATA and advisory evidence only; the model still produces only verdict text, and `FLEET_TOKEN` never reaches it.
+  No deterministic downstream step reads model-written files because verdict capture uses the action `execution_file` result event.
   Claude does not write a verdict file.
   The Claude action allows only `github-actions[bot]` as a bot actor so the maintainer-gated Investigate dispatch can pass; it must not allow `*` or any external bot actor.
   Its final response is captured from the action's `execution_file` output by preferring the clean `type: "result"` event's `result` string, falling back to the last assistant text, and the trusted workflow step posts that text as a card comment with `github.token`.
@@ -377,7 +378,7 @@ verdict, `pull_request_target` posture detection, and the auto-approve-vs-card r
 CI approval, and issue triage, no network, and
 `python tests/test_deep_review.py` - the always-on/code-grounded deep-review +
 Investigate wiring: render options, the removed enable flag, the token-absent
-note, the `persist-credentials: false` checkout + read-only tool isolation, the
+note, the `persist-credentials: false` checkout + tool isolation, the
 narrow `allowed_bots`, the optional READONLY_TOKEN-gated `wheelhouse-search`
 wiring, the action-output verdict capture, issue-only manual dispatch, and the
 handler's immutable-input `workflow_dispatch` trigger, all by inspecting the

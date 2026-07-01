@@ -17,12 +17,12 @@ so these tests pin the *wiring* instead:
     than silently no-opping;
   * code-grounded + security: deep-review.yml checks out the target with
     FLEET_TOKEN and `persist-credentials: false`, runs Claude restricted to
-    read-only exploration tools (Read/Grep/Glob, plus optional
-    Bash(wheelhouse-search) only when READONLY_TOKEN exists), and the Claude
-    step never receives FLEET_TOKEN; it narrowly allows only the GitHub Actions
-    bot because maintainer-gated Investigate dispatches this workflow via
-    github.token; the trusted post step captures the action's final output from
-    `execution_file` and posts it with the default token;
+    read-only exploration tools (Read/Grep/Glob, plus optional Write for
+    search-request.json and Bash(wheelhouse-search) only when READONLY_TOKEN
+    exists), and the Claude step never receives FLEET_TOKEN; it narrowly allows
+    only the GitHub Actions bot because maintainer-gated Investigate dispatches
+    this workflow via github.token; the trusted post step captures the action's
+    final output from `execution_file` and posts it with the default token;
   * prompt boundary: the mutable decision card, target diff/issue text, and
     target code are all presented as delimited untrusted data;
   * investigate trigger: decision-handler.yml keeps `actions: write` only on an
@@ -203,6 +203,21 @@ def test_readonly_search_wiring():
             "related, duplicate, or superseding PRs/issues" in run
             and "cross-reference them in your verdict" in run,
         )
+        check(
+            "workflow: search prompt keeps the request-file contract",
+            "write a JSON request to \\`search-request.json\\`, then run" in run
+            and "exactly \\`wheelhouse-search\\`" in run,
+        )
+        check(
+            "workflow: search prompt narrows model writes",
+            "Do not write any other file" in run
+            and "never attempt a code change or act operation" in run,
+        )
+        check(
+            "workflow: final prompt keeps the search write exception",
+            "Do not write files other than search-request.json" in run
+            and "Do not write files, modify code" in run,
+        )
 
     check("workflow: read-only search wrapper install step exists", install is not None)
     if install:
@@ -369,6 +384,10 @@ def test_code_grounded_checkout_and_tool_isolation():
             "Bash" not in args,
         )
         check(
+            "security: legacy Claude is NOT granted Write",
+            "Write" not in args,
+        )
+        check(
             "security: legacy Claude runs only when readonly search is disabled",
             "steps.readonly.outputs.enabled != 'true'" in str(legacy.get("if", "")),
         )
@@ -395,11 +414,11 @@ def test_code_grounded_checkout_and_tool_isolation():
             "steps.readonly.outputs.enabled == 'true'" in str(search.get("if", "")),
         )
         check(
-            "security: search Claude is read-only plus scoped search only",
+            "security: search Claude has Write for request-file search",
             "--allowedTools" in args
-            and "Read,Grep,Glob" in args
+            and "Read,Grep,Glob,Write,Bash(wheelhouse-search)" in args
+            and "Write" in args
             and "Bash(wheelhouse-search)" in args
-            and "Write" not in args,
         )
         for forbidden in (
             "Bash(gh",
