@@ -279,6 +279,94 @@ def test_upsert_parses_state_block_after_refetch():
           isinstance(calls["old_state"], dict) and calls["old_state"].get("priority") == "med")
 
 
+def test_refresh_preserves_same_head_triage_cache_and_section():
+    it = item()
+    triaged = rc.body_with_triage_result(
+        rc.body_with_triage_queued(rc.render(it)["body"], it),
+        it["head_sha"],
+        triage={
+            "summary": "Keeps useful context.",
+            "product_implications": "No product risk.",
+            "recommended_next_step": "merge - still safe.",
+        },
+    )
+    existing = {
+        "body": triaged,
+        "labels": labels("needs-decision", "repo:lavish-axi", "kind:pr-review",
+                         "priority:med", "target:lavish-axi-42"),
+    }
+    old_state = core.parse_state_block(triaged)
+    card = rc.render(item(priority="high"))
+    calls = {}
+
+    old_write = rc._write_body
+    old_gh = rc._gh
+    old_unlink = rc.os.unlink
+
+    def fake_write(body):
+        calls["body"] = body
+        return "/tmp/wheelhouse-test-body"
+
+    rc._write_body = fake_write
+    rc._gh = lambda args, check=True: None
+    rc.os.unlink = lambda path: None
+    try:
+        rc._refresh_card(7, card, existing, item(priority="high"), old_state)
+    finally:
+        rc._write_body = old_write
+        rc._gh = old_gh
+        rc.os.unlink = old_unlink
+
+    state = core.parse_state_block(calls["body"])
+    check("refresh: same-head triage section is preserved", "Keeps useful context." in calls["body"])
+    check("refresh: same-head triaged_sha is preserved", state.get("triaged_sha") == it["head_sha"])
+    check("refresh: material priority still updates", state.get("priority") == "high")
+
+
+def test_refresh_drops_triage_when_head_changes():
+    old = item()
+    triaged = rc.body_with_triage_result(
+        rc.body_with_triage_queued(rc.render(old)["body"], old),
+        old["head_sha"],
+        triage={
+            "summary": "Old head context.",
+            "product_implications": "No longer current.",
+            "recommended_next_step": "merge - old head.",
+        },
+    )
+    existing = {
+        "body": triaged,
+        "labels": labels("needs-decision", "repo:lavish-axi", "kind:pr-review",
+                         "priority:med", "target:lavish-axi-42"),
+    }
+    new = item(head_sha="newhead999")
+    card = rc.render(new)
+    calls = {"comments": []}
+
+    old_write = rc._write_body
+    old_gh = rc._gh
+    old_unlink = rc.os.unlink
+
+    def fake_write(body):
+        calls["body"] = body
+        return "/tmp/wheelhouse-test-body"
+
+    rc._write_body = fake_write
+    rc._gh = lambda args, check=True: calls["comments"].append(args) if "comment" in args else None
+    rc.os.unlink = lambda path: None
+    try:
+        rc._refresh_card(7, card, existing, new, core.parse_state_block(triaged))
+    finally:
+        rc._write_body = old_write
+        rc._gh = old_gh
+        rc.os.unlink = old_unlink
+
+    state = core.parse_state_block(calls["body"])
+    check("refresh: new head drops old triage section", "Old head context." not in calls["body"])
+    check("refresh: new head drops triaged_sha", "triaged_sha" not in state)
+    check("refresh: new head state is current", state.get("head_sha") == "newhead999")
+
+
 # --------------------------------------------------------------------------- #
 # label replace: stale managed labels removed, needs-decision + human kept
 # --------------------------------------------------------------------------- #
@@ -331,6 +419,8 @@ def main():
     test_is_refreshable_accepts_plain_strings()
     test_upsert_refetches_known_card_before_refresh()
     test_upsert_parses_state_block_after_refetch()
+    test_refresh_preserves_same_head_triage_cache_and_section()
+    test_refresh_drops_triage_when_head_changes()
     test_plan_label_update_replaces_stale_managed()
     test_plan_label_update_keeps_human_labels()
     test_plan_label_update_noop_when_identical()

@@ -88,7 +88,7 @@ def normalize(d):
         )
     except SystemExit:
         auto_triage = True
-    if "auto_triage" in d:
+    if "auto_triage" in d and not boolish(d.get("auto_triage")):
         auto_triage = boolish(d.get("auto_triage"))
 
     return {

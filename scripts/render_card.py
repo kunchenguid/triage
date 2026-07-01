@@ -264,6 +264,11 @@ def remove_triage_section(body):
     return _TRIAGE_SECTION_RE.sub("\n", body or "").strip() + "\n"
 
 
+def _existing_triage_section(body):
+    match = _TRIAGE_SECTION_RE.search(body or "")
+    return match.group(0).strip() if match else ""
+
+
 def _insert_triage_section(body, section):
     without = remove_triage_section(body).rstrip()
     marker = "\n### Recommended action"
@@ -284,6 +289,26 @@ def _replace_state_block(body, state):
     if _STATE_BLOCK_RE.search(body or ""):
         return _STATE_BLOCK_RE.sub(marker, body, count=1)
     return (body or "").rstrip() + "\n\n" + marker
+
+
+def _preserve_same_head_triage(body, existing_body, item, old_state):
+    head_sha = item.get("head_sha", "") or ""
+    if not head_sha or (old_state or {}).get("head_sha") != head_sha:
+        return body
+
+    section = _existing_triage_section(existing_body)
+    if section:
+        body = _insert_triage_section(body, section)
+
+    state = parse_state_block(body)
+    if not state:
+        return body
+    changed = False
+    for key in ("triaged_sha", "triage_status", "triage_error"):
+        if key in (old_state or {}):
+            state[key] = old_state[key]
+            changed = True
+    return _replace_state_block(body, state) if changed else body
 
 
 def _state_with_triage(state, head_sha, status, error=None):
@@ -517,6 +542,13 @@ def _refresh_card(number, card, existing, item, old_state):
     If the target's head moved, drop a short comment so the owner sees a
     re-review is warranted rather than being silently swapped underneath."""
     to_add, to_remove = plan_label_update(card["labels"], existing.get("labels"))
+    card = dict(card)
+    card["body"] = _preserve_same_head_triage(
+        card["body"],
+        existing.get("body", ""),
+        item,
+        old_state,
+    )
     body_path = _write_body(card["body"])
     try:
         args = ["issue", "edit", str(number), "--body-file", body_path]

@@ -224,11 +224,18 @@ def test_build_item_carries_effective_auto_triage():
         payload_off = build_item.normalize(
             {"repo": "other", "number": 3, "auto_triage": "false"}
         )
+        payload_on_still_off = build_item.normalize(
+            {"repo": "wheelhouse", "number": 4, "auto_triage": "true"}
+        )
     finally:
         build_item.load_config = old_load
     check("build_item: per-repo auto_triage false carried", off["auto_triage"] is False)
     check("build_item: global default true carried", default_on["auto_triage"] is True)
     check("build_item: string false payload is false", payload_off["auto_triage"] is False)
+    check(
+        "build_item: payload true cannot override config false",
+        payload_on_still_off["auto_triage"] is False,
+    )
 
 
 def test_render_triage_section_has_no_mentions_and_caches_sha():
