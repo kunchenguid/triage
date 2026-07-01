@@ -315,6 +315,24 @@ def _append_line(path, line):
             f.write(line + "\n")
 
 
+def _prepare_tool_dir(tool_dir):
+    if os.path.lexists(tool_dir):
+        st = os.lstat(tool_dir)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise ValueError("search tool path must be a directory")
+        os.chmod(tool_dir, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        for name in os.listdir(tool_dir):
+            path = os.path.join(tool_dir, name)
+            if name != "wheelhouse-search":
+                raise ValueError("search tool directory must contain only wheelhouse-search")
+            child = os.lstat(path)
+            if stat.S_ISDIR(child.st_mode):
+                raise ValueError("wheelhouse-search path must not be a directory")
+            os.unlink(path)
+    else:
+        os.makedirs(tool_dir, mode=stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+
+
 def cmd_install():
     if core is None:
         sys.exit("wheelhouse_core unavailable")
@@ -326,10 +344,11 @@ def cmd_install():
     tool_dir = os.environ.get("WHEELHOUSE_SEARCH_TOOL_DIR", "").strip()
     if not tool_dir:
         tool_dir = os.path.join(os.environ.get("RUNNER_TEMP", "."), "wheelhouse-tools")
-    os.makedirs(tool_dir, exist_ok=True)
+    _prepare_tool_dir(tool_dir)
     tool_path = os.path.join(tool_dir, "wheelhouse-search")
     shutil.copyfile(os.path.abspath(__file__), tool_path)
-    os.chmod(tool_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    os.chmod(tool_path, stat.S_IRUSR | stat.S_IXUSR)
+    os.chmod(tool_dir, stat.S_IRUSR | stat.S_IXUSR)
     _append_line(
         os.environ.get("GITHUB_ENV"),
         "WHEELHOUSE_SEARCH_ALLOWED_REPOS=%s" % json.dumps(repos, separators=(",", ":")),

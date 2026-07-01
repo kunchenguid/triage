@@ -7,7 +7,9 @@ Run: python tests/test_nl_decisions_search.py   (needs PyYAML)
 """
 
 import os
+import stat
 import sys
+import tempfile
 
 import yaml
 
@@ -51,6 +53,17 @@ def step_index(steps, predicate):
 
 def claude_steps(steps):
     return [s for s in steps if "claude-code-action" in str(s.get("uses", ""))]
+
+
+def hardened_shell_env(step):
+    env = (step or {}).get("env") or {}
+    return (
+        env.get("PATH") == "${{ steps.trusted-src.outputs.safe_path }}"
+        and env.get("BASH_ENV") == ""
+        and env.get("ENV") == ""
+        and env.get("LD_PRELOAD") == ""
+        and env.get("LD_LIBRARY_PATH") == ""
+    )
 
 
 def test_handle_checkout_does_not_persist_default_token():
@@ -311,15 +324,99 @@ def test_search_wrapper_rejects_query_scope_qualifiers():
     check("wrapper: query repo qualifiers are rejected", blocked)
 
 
+def test_search_wrapper_installs_non_writable_tool():
+    keys = [
+        "GITHUB_REPOSITORY_OWNER",
+        "TARGET_REPO",
+        "WHEELHOUSE_SEARCH_TOOL_DIR",
+        "GITHUB_ENV",
+        "GITHUB_PATH",
+    ]
+    old_env = {key: os.environ.get(key) for key in keys}
+    with tempfile.TemporaryDirectory() as tmp:
+        tool_dir = os.path.join(tmp, "tools")
+        tool = os.path.join(tool_dir, "wheelhouse-search")
+        env_file = os.path.join(tmp, "env")
+        path_file = os.path.join(tmp, "path")
+        try:
+            os.environ.update(
+                {
+                    "GITHUB_REPOSITORY_OWNER": "owner",
+                    "TARGET_REPO": "target",
+                    "WHEELHOUSE_SEARCH_TOOL_DIR": tool_dir,
+                    "GITHUB_ENV": env_file,
+                    "GITHUB_PATH": path_file,
+                }
+            )
+            nls.cmd_install()
+            dir_mode = stat.S_IMODE(os.stat(tool_dir).st_mode)
+            tool_mode = stat.S_IMODE(os.stat(tool).st_mode)
+            check("wrapper: install creates only wheelhouse-search", os.listdir(tool_dir) == ["wheelhouse-search"])
+            check("wrapper: installed directory is executable", bool(dir_mode & stat.S_IXUSR))
+            check("wrapper: installed directory is not owner-writable", not bool(dir_mode & stat.S_IWUSR))
+            check("wrapper: installed tool is executable", bool(tool_mode & stat.S_IXUSR))
+            check("wrapper: installed tool is not owner-writable", not bool(tool_mode & stat.S_IWUSR))
+            check("wrapper: install adds immutable directory to PATH", read_file(path_file).strip() == tool_dir)
+        finally:
+            if os.path.exists(tool):
+                os.chmod(tool, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+            if os.path.isdir(tool_dir):
+                os.chmod(tool_dir, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
+def read_file(path):
+    with open(path) as f:
+        return f.read()
+
+
 def test_claude_output_is_isolated_before_routing():
     steps = handle_steps()
+    trusted = step_by_id(steps, "trusted-src")
     preserve = step_by_id(steps, "nl-result")
-    restore = step_by_name(steps, "Restore deterministic checkout after Claude")
     route = step_by_id(steps, "route")
+    execute = step_by_id(steps, "execute")
+
+    check("workflow: trusted source snapshot step exists", trusted is not None)
+    if trusted:
+        run = str(trusted.get("run", ""))
+        check(
+            "workflow: trusted source is copied outside the Claude workspace",
+            "${RUNNER_TEMP}/wheelhouse-trusted-src" in run
+            and "tar --exclude=.git" in run,
+        )
+        check(
+            "workflow: trusted source is made read-only",
+            'find "$trusted" -type f -exec chmod a-w {} +' in run
+            and 'find "$trusted" -type d -exec chmod a-w {} +' in run,
+        )
+        check(
+            "workflow: trusted source path is exposed as a step output",
+            'echo "path=$trusted"' in run and "$GITHUB_OUTPUT" in run,
+        )
+        check(
+            "workflow: trusted tool paths are captured before Claude",
+            "python_path=\"$(command -v python)\"" in run
+            and "gh_path=\"$(command -v gh)\"" in run,
+        )
+        check(
+            "workflow: trusted safe PATH is exposed as a step output",
+            'echo "python=$python_path"' in run
+            and 'echo "safe_path=$safe_path"' in run,
+        )
 
     check("workflow: nl-result step exists", preserve is not None)
     if preserve:
+        env = preserve.get("env", {})
         run = str(preserve.get("run", ""))
+        check(
+            "workflow: nl-result uses trusted shell PATH",
+            hardened_shell_env(preserve),
+        )
         check(
             "workflow: nl-result stores only decision.json in runner temp",
             "${RUNNER_TEMP}/wheelhouse-nl" in run
@@ -334,35 +431,87 @@ def test_claude_output_is_isolated_before_routing():
             "65536" in run and "wc -c < decision.json" in run,
         )
 
-    check("workflow: post-Claude checkout restore exists", restore is not None)
-    if restore:
-        restore_with = restore.get("with") or {}
-        check(
-            "workflow: post-Claude checkout cleans tracked and untracked tampering",
-            restore_with.get("clean") is True,
-        )
-        check(
-            "workflow: post-Claude checkout does not persist github.token",
-            restore_with.get("persist-credentials") is False,
-        )
+    check(
+        "workflow: post-Claude in-place checkout restore is absent",
+        step_by_name(steps, "Restore deterministic checkout after Claude") is None,
+    )
 
     check("workflow: nl-route step still exists", route is not None)
     if route:
         env = route.get("env", {})
+        run = str(route.get("run", ""))
+        check(
+            "workflow: nl-route runs from trusted source",
+            route.get("working-directory") == "${{ steps.trusted-src.outputs.path }}",
+        )
+        check(
+            "workflow: nl-route uses captured trusted Python",
+            env.get("TRUSTED_PYTHON") == "${{ steps.trusted-src.outputs.python }}",
+        )
+        check(
+            "workflow: nl-route uses trusted shell PATH",
+            hardened_shell_env(route)
+            and env.get("TRUSTED_PATH") == "${{ steps.trusted-src.outputs.safe_path }}",
+        )
         check(
             "workflow: nl-route reads the isolated decision file",
             env.get("DECISION_FILE")
             == "${{ runner.temp }}/wheelhouse-nl/decision.json",
         )
+        check(
+            "workflow: nl-route scrubs inherited model environment",
+            "env -i" in run
+            and "PYTHONDONTWRITEBYTECODE=1" in run
+            and "PYTHONNOUSERSITE=1" in run
+            and '"$TRUSTED_PYTHON" scripts/apply_decision.py nl-route' in run,
+        )
 
+    check("workflow: execute step still exists", execute is not None)
+    if execute:
+        env = execute.get("env", {})
+        run = str(execute.get("run", ""))
+        check(
+            "workflow: execute runs from trusted source",
+            execute.get("working-directory") == "${{ steps.trusted-src.outputs.path }}",
+        )
+        check(
+            "workflow: execute uses captured trusted Python",
+            env.get("TRUSTED_PYTHON") == "${{ steps.trusted-src.outputs.python }}",
+        )
+        check(
+            "workflow: execute uses trusted shell PATH",
+            hardened_shell_env(execute)
+            and env.get("TRUSTED_PATH") == "${{ steps.trusted-src.outputs.safe_path }}",
+        )
+        check(
+            "workflow: execute scrubs inherited model environment",
+            "env -i" in run
+            and "PYTHONDONTWRITEBYTECODE=1" in run
+            and "PYTHONNOUSERSITE=1" in run
+            and 'GH_TOKEN="$GH_TOKEN"' in run
+            and '"$TRUSTED_PYTHON" scripts/apply_decision.py execute' in run,
+        )
+
+    for name in ("Comment result on card", "Close resolved card", "Post NL reply"):
+        step = step_by_name(steps, name)
+        check(
+            "workflow: %s uses trusted gh PATH" % name,
+            step is not None and hardened_shell_env(step),
+        )
+
+    trusted_i = step_index(steps, lambda s: s.get("id") == "trusted-src")
     preserve_i = step_index(steps, lambda s: s.get("id") == "nl-result")
-    restore_i = step_index(
-        steps, lambda s: s.get("name") == "Restore deterministic checkout after Claude"
-    )
     route_i = step_index(steps, lambda s: s.get("id") == "route")
+    execute_i = step_index(steps, lambda s: s.get("id") == "execute")
     claude_indexes = [
         i for i, s in enumerate(steps) if "claude-code-action" in str(s.get("uses", ""))
     ]
+    check(
+        "workflow: trusted source is prepared before every Claude step",
+        trusted_i is not None
+        and claude_indexes
+        and all(trusted_i < i for i in claude_indexes),
+    )
     check(
         "workflow: nl-result runs after every Claude step",
         preserve_i is not None
@@ -370,8 +519,8 @@ def test_claude_output_is_isolated_before_routing():
         and all(i < preserve_i for i in claude_indexes),
     )
     check(
-        "workflow: checkout restore runs before nl-route",
-        None not in (preserve_i, restore_i, route_i) and preserve_i < restore_i < route_i,
+        "workflow: trusted deterministic steps run after result isolation",
+        None not in (preserve_i, route_i, execute_i) and preserve_i < route_i < execute_i,
     )
 
 
@@ -383,9 +532,10 @@ def test_route_and_execute_stay_deterministic():
     check("workflow: nl-route step still exists", route is not None)
     if route:
         dumped = yaml.safe_dump(route)
+        run = str(route.get("run", ""))
         check(
             "workflow: nl-route still runs the deterministic trust boundary",
-            str(route.get("run", "")).strip() == "python scripts/apply_decision.py nl-route",
+            "scripts/apply_decision.py nl-route" in run and "env -i" in run,
         )
         check(
             "workflow: nl-route does not receive READONLY_TOKEN or FLEET_TOKEN",
@@ -396,6 +546,7 @@ def test_route_and_execute_stay_deterministic():
     if execute:
         dumped = yaml.safe_dump(execute)
         env = execute.get("env", {})
+        run = str(execute.get("run", ""))
         check(
             "workflow: execute still acts under FLEET_TOKEN",
             env.get("GH_TOKEN") == "${{ secrets.FLEET_TOKEN }}",
@@ -406,7 +557,7 @@ def test_route_and_execute_stay_deterministic():
         )
         check(
             "workflow: execute script is unchanged",
-            str(execute.get("run", "")).strip() == "python scripts/apply_decision.py execute",
+            "scripts/apply_decision.py execute" in run and "env -i" in run,
         )
 
 
@@ -420,6 +571,7 @@ def main():
     test_search_wrapper_hardcodes_repo_flags()
     test_search_wrapper_places_untrusted_query_after_separator()
     test_search_wrapper_rejects_query_scope_qualifiers()
+    test_search_wrapper_installs_non_writable_tool()
     test_claude_output_is_isolated_before_routing()
     test_route_and_execute_stay_deterministic()
     print()

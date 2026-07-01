@@ -49,6 +49,24 @@ jobs:
       - name: Install deps
         run: pip install --quiet pyyaml
 
+      - id: trusted-src
+        run: |
+          set -euo pipefail
+          trusted="${RUNNER_TEMP}/wheelhouse-trusted-src"
+          python_path="$(command -v python)"
+          gh_path="$(command -v gh)"
+          safe_path="$(dirname "$python_path"):$(dirname "$gh_path"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          rm -rf "$trusted"
+          mkdir -p "$trusted"
+          tar --exclude=.git -cf - . | tar -xf - -C "$trusted"
+          find "$trusted" -type f -exec chmod a-w {} +
+          find "$trusted" -type d -exec chmod a-w {} +
+          {
+            echo "path=$trusted"
+            echo "python=$python_path"
+            echo "safe_path=$safe_path"
+          } >> "$GITHUB_OUTPUT"
+
       # Owner-gate: only the repository owner (or the configured `maintainer`)
       # may drive a decision. Strangers' events become no-ops because every
       # acting step below is gated on this output (and the LLM never runs for
@@ -251,6 +269,12 @@ jobs:
 
       - id: nl-result
         if: steps.nl-gate.outputs.proceed == 'true'
+        env:
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
         run: |
           set -euo pipefail
           out_dir="${RUNNER_TEMP}/wheelhouse-nl"
@@ -271,23 +295,36 @@ jobs:
             cp decision.json "$out_file"
           fi
 
-      - name: Restore deterministic checkout after Claude
-        if: steps.nl-gate.outputs.proceed == 'true'
-        uses: actions/checkout@v4
-        with:
-          clean: true
-          persist-credentials: false
-
       # Validate the LLM's structured result against the per-kind allowlist and
       # emit deterministic outputs. `decision` is non-empty ONLY for a valid
       # `action` mode - that is what makes the execute step below run.
       - id: route
         if: steps.nl-gate.outputs.proceed == 'true'
+        working-directory: ${{ steps.trusted-src.outputs.path }}
         env:
+          TRUSTED_PYTHON: ${{ steps.trusted-src.outputs.python }}
+          TRUSTED_PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
           DECISION_FILE: ${{ runner.temp }}/wheelhouse-nl/decision.json
           ISSUE_BODY: ${{ github.event.issue.body }}
           KIND: ${{ steps.nl-gate.outputs.kind }}
-        run: python scripts/apply_decision.py nl-route
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          PYTHONHOME: ""
+          PYTHONPATH: ""
+        run: |
+          set -euo pipefail
+          env -i \
+            PATH="$TRUSTED_PATH" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONNOUSERSITE=1 \
+            GITHUB_OUTPUT="$GITHUB_OUTPUT" \
+            DECISION_FILE="$DECISION_FILE" \
+            ISSUE_BODY="$ISSUE_BODY" \
+            KIND="$KIND" \
+            "$TRUSTED_PYTHON" scripts/apply_decision.py nl-route
 
       # --- Act on the target (shared by every entry point) -------------------
       - name: Mark processing
@@ -304,7 +341,11 @@ jobs:
       # may also use FLEET_TOKEN, but only for read-only target context.
       - id: execute
         if: ${{ steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action' }}
+        working-directory: ${{ steps.trusted-src.outputs.path }}
         env:
+          TRUSTED_PYTHON: ${{ steps.trusted-src.outputs.python }}
+          TRUSTED_PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
           # Cross-repo actions require FLEET_TOKEN. Never the default token,
           # never printed.
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
@@ -315,7 +356,31 @@ jobs:
           TARGET_NUMBER: ${{ steps.decide.outputs.target_number || steps.route.outputs.target_number }}
           KIND: ${{ steps.decide.outputs.kind || steps.route.outputs.kind }}
           HEAD_SHA: ${{ steps.decide.outputs.head_sha || steps.route.outputs.head_sha }}
-        run: python scripts/apply_decision.py execute
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          PYTHONHOME: ""
+          PYTHONPATH: ""
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/wheelhouse-home"
+          env -i \
+            PATH="$TRUSTED_PATH" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONNOUSERSITE=1 \
+            HOME="${RUNNER_TEMP}/wheelhouse-home" \
+            GH_PROMPT_DISABLED=1 \
+            GITHUB_OUTPUT="$GITHUB_OUTPUT" \
+            GH_TOKEN="$GH_TOKEN" \
+            GITHUB_REPOSITORY_OWNER="$GITHUB_REPOSITORY_OWNER" \
+            DECISION="$DECISION" \
+            FREE_TEXT="$FREE_TEXT" \
+            TARGET_REPO="$TARGET_REPO" \
+            TARGET_NUMBER="$TARGET_NUMBER" \
+            KIND="$KIND" \
+            HEAD_SHA="$HEAD_SHA" \
+            "$TRUSTED_PYTHON" scripts/apply_decision.py execute
 
       # --- Finalize the card (this repo, default token; never re-triggers) ----
       - name: Comment result on card
@@ -324,6 +389,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
           MESSAGE: ${{ steps.execute.outputs.result_message }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          GH_PROMPT_DISABLED: "1"
         run: gh issue comment "$ISSUE" --body "${MESSAGE:-No actionable result.}" || true
 
       - name: Clear processing label
@@ -368,6 +439,12 @@ jobs:
         if: ${{ always() && steps.execute.outputs.terminal_state == 'resolved' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          GH_PROMPT_DISABLED: "1"
         run: gh issue close "${{ github.event.issue.number }}" || true
 
       # --- NL answer / clarify: post the reply, leave the card OPEN ----------
@@ -377,6 +454,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
           REPLY: ${{ steps.route.outputs.answer }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          GH_PROMPT_DISABLED: "1"
         run: gh issue comment "$ISSUE" --body "$REPLY" || true
 
   investigate-dispatch:
