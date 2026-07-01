@@ -32,6 +32,7 @@ Usage:
   wheelhouse_core.py checks <repo>        list distinct check names on a repo's PRs (onboarding)
   wheelhouse_core.py authorized           print true/false: is $SENDER allowed to drive decisions?
   wheelhouse_core.py nl-decisions-enabled print true/false: is nl_decisions on in config?
+  wheelhouse_core.py auto-triage-enabled <repo> print true/false for one configured repo
   wheelhouse_core.py state <field>        print one field of the state block in $ISSUE_BODY
   wheelhouse_core.py repos                list configured repos
 
@@ -142,6 +143,9 @@ def load_config():
         # fork still gets scan-time auto-approval of provably-safe fork-CI runs.
         # Set false to restore the click-to-approve-everything behavior.
         "auto_approve_ci": bool(cfg.get("auto_approve_ci", True)),
+        # Advisory LLM triage is DEFAULT ON when the Claude token exists. The
+        # flag is only a spend-control opt-out; absence keeps fresh forks useful.
+        "auto_triage": bool(cfg.get("auto_triage", True)),
     }
 
 
@@ -421,6 +425,16 @@ def _auto_approve_enabled(repo_cfg, global_default):
     return global_default if v is None else bool(v)
 
 
+def _auto_triage_enabled(repo_cfg, global_default):
+    """Effective auto_triage for one repo, mirroring auto_approve_ci.
+
+    Default ON keeps a fresh fork useful once CLAUDE_CODE_OAUTH_TOKEN is present;
+    the global or per-repo false value is a token-spend opt-out.
+    """
+    v = repo_cfg.get("auto_triage")
+    return global_default if v is None else bool(v)
+
+
 def _author_login(author):
     if not isinstance(author, dict):
         return ""
@@ -651,7 +665,7 @@ def _auto_approve_or_card(
     return (False, _ci_safety_note(verdict), log_note)
 
 
-def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
+def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True, auto_triage=True):
     """Scan one repo. Returns (repo_result, items).
 
     Decision cards are for other people's work, so scan-built PR-review and
@@ -659,7 +673,8 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
     metadata fails open.
 
     `auto_approve_ci` is the fleet-wide default (config `auto_approve_ci`, itself
-    defaulting True); a repo may override it per-repo. Same-repo PRs with no CI
+    defaulting True); a repo may override it per-repo. `auto_triage` mirrors that
+    model for the advisory Claude pass on pr-review cards. Same-repo PRs with no CI
     signal route to normal review, not CI approval. Unknown fork status keeps a
     manual CI-approval card with no auto-approve attempt for contributor-authored
     PRs and logs a suppressed card for owner/maintainer/bot-authored PRs. When
@@ -734,6 +749,7 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
     addressed = {n for n in closing if n in set(open_issue_numbers)}
 
     auto_enabled = _auto_approve_enabled(repo_cfg, auto_approve_ci)
+    triage_enabled = _auto_triage_enabled(repo_cfg, auto_triage)
     default_posture = None
 
     items = []
@@ -764,6 +780,8 @@ def build_repo(owner, repo_cfg, card_issues, auto_approve_ci=True):
             "recommendation": _recommendation(pr["bucket"]),
             "priority": priority,
         }
+        if kind == "pr-review":
+            item["auto_triage"] = triage_enabled
 
         if kind == "ci-approval":
             if pr.get("cross_repo") is not True:
@@ -1453,7 +1471,11 @@ def cmd_scan(only_repo=None):
     items = []
     for name in names:
         result, repo_items = build_repo(
-            owner, repos[name], cfg["card_issues"], cfg["auto_approve_ci"]
+            owner,
+            repos[name],
+            cfg["card_issues"],
+            cfg["auto_approve_ci"],
+            cfg["auto_triage"],
         )
         out_repos[name] = result
         items.extend(repo_items)
@@ -1465,6 +1487,7 @@ def cmd_scan(only_repo=None):
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "card_issues": cfg["card_issues"],
         "auto_approve_ci": cfg["auto_approve_ci"],
+        "auto_triage": cfg["auto_triage"],
         "repos": out_repos,
         "items": items,
     }
@@ -1547,6 +1570,17 @@ def cmd_nl_decisions_enabled():
     print("true" if load_config()["nl_decisions"] else "false")
 
 
+def cmd_auto_triage_enabled(repo):
+    cfg = load_config()
+    if repo not in cfg["repos"]:
+        sys.exit("unknown repo '%s'" % repo)
+    print(
+        "true"
+        if _auto_triage_enabled(cfg["repos"][repo], cfg["auto_triage"])
+        else "false"
+    )
+
+
 def cmd_state(field):
     """Print one field of the state block in $ISSUE_BODY (for the deep-review workflow)."""
     st = parse_state_block(os.environ.get("ISSUE_BODY", ""))
@@ -1567,6 +1601,8 @@ def main():
         cmd_authorized()
     elif cmd == "nl-decisions-enabled":
         cmd_nl_decisions_enabled()
+    elif cmd == "auto-triage-enabled" and len(sys.argv) == 3:
+        cmd_auto_triage_enabled(sys.argv[2])
     elif cmd == "state" and len(sys.argv) == 3:
         cmd_state(sys.argv[2])
     elif cmd == "repos":

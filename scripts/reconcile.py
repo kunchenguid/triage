@@ -10,6 +10,8 @@ fleet (scan.json) and the current open cards in THIS repo (cards.json), it:
     state changed (head_sha/compliance/tests/kind/priority/options) - so the queue
     reflects current state, not just the snapshot taken when the card was first
     created - and leaves materially-unchanged cards completely untouched, and
+  * queues lightweight automatic PR triage for eligible pure pending pr-review
+    cards whose current head lacks a `triaged_sha` cache, and
   * closes any open card whose underlying PR/issue is no longer open, and closes
     pure pending cards whose open target no longer needs a maintainer decision -
     so the queue self-heals even if a dispatch was lost.
@@ -57,6 +59,33 @@ def current_card(row):
     }
 
 
+def auto_triage_has_token():
+    return os.environ.get("WHEELHOUSE_AUTO_TRIAGE_HAS_TOKEN", "").lower() == "true"
+
+
+def maybe_queue_auto_triage(item, row, has_token):
+    """Queue lightweight advisory PR triage when this card head lacks a cache.
+
+    The card is marked queued before dispatch so a failed workflow still counts
+    as this head's one attempt. Only pure needs-decision pr-review cards qualify.
+    """
+    if not row:
+        return False
+    if not render_card.should_auto_triage(item, row.get("state"), row.get("labels"), has_token):
+        return False
+    try:
+        if not render_card.mark_triage_queued(row["number"], item, row.get("body", "")):
+            return False
+        render_card.dispatch_triage_workflow(row["number"], item)
+        print("queued auto triage for %s#%s on card #%s"
+              % (item["repo"], item["number"], row["number"]))
+        return True
+    except Exception as e:
+        print("::warning::failed to queue auto triage for card #%s (%s#%s): %s"
+              % (row.get("number"), item.get("repo"), item.get("number"), str(e)[:160]))
+        return False
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit("usage: reconcile.py scan.json cards.json")
@@ -91,38 +120,46 @@ def main():
     #    this path never refreshes a card for a repo whose state is unknown.
     created = 0
     refreshed = 0
+    triage_queued = 0
+    has_triage_token = auto_triage_has_token()
     for item in items:
         key = (item["repo"], int(item["number"]))
         ex = existing.get(key)
+        current_for_triage = None
         if ex is None:
             try:
                 render_card.upsert_card(item)
                 created += 1
+                found = render_card.find_card(render_card.marker_label(item))
+                current_for_triage = current_card(found) if found else None
             except Exception as e:  # one bad item must not abort the whole pass
                 print("::warning::failed to create card for %s#%s: %s"
                       % (item["repo"], item["number"], str(e)[:160]))
+            if maybe_queue_auto_triage(item, current_for_triage, has_triage_token):
+                triage_queued += 1
             continue
         # Card exists: refresh only a pure needs-decision card whose target
         # materially changed. A card mid-decision (processing/resolved/blocked)
         # or with no material change is left completely untouched (no edit, no
         # comment). `upsert_card` re-checks both guards before it edits.
-        if not render_card.is_refreshable(ex["labels"]):
-            continue
-        if not render_card.material_changed(item, ex["state"]):
-            continue
-        try:
-            current = current_card(ex)
-            if current is None:
-                continue
-            if not render_card.is_refreshable(current["labels"]):
-                continue
-            if not render_card.material_changed(item, current["state"]):
-                continue
-            render_card.upsert_card(item, existing=current)
-            refreshed += 1
-        except Exception as e:
-            print("::warning::failed to refresh card #%s for %s#%s: %s"
-                  % (ex["number"], item["repo"], item["number"], str(e)[:160]))
+        if render_card.is_refreshable(ex["labels"]) and render_card.material_changed(item, ex["state"]):
+            try:
+                current = current_card(ex)
+                current_for_triage = current
+                if current is not None and render_card.is_refreshable(current["labels"]):
+                    if render_card.material_changed(item, current["state"]):
+                        render_card.upsert_card(item, existing=current)
+                        refreshed += 1
+                        current_for_triage = current_card(current)
+            except Exception as e:
+                print("::warning::failed to refresh card #%s for %s#%s: %s"
+                      % (ex["number"], item["repo"], item["number"], str(e)[:160]))
+        if current_for_triage is None and render_card.should_auto_triage(
+            item, ex["state"], ex["labels"], has_triage_token
+        ):
+            current_for_triage = current_card(ex)
+        if maybe_queue_auto_triage(item, current_for_triage, has_triage_token):
+            triage_queued += 1
 
     # 2) Close cards whose target is no longer open, and pure pending cards whose
     #    open target no longer appears in the current maintainer worklist (for
@@ -174,8 +211,8 @@ def main():
         except Exception as e:
             print("::warning::failed to close card #%s: %s" % (card_number, str(e)[:160]))
 
-    print("reconcile: %d card(s) created, %d refreshed, %d card(s) closed"
-          % (created, refreshed, closed))
+    print("reconcile: %d card(s) created, %d refreshed, %d auto-triage queued, %d card(s) closed"
+          % (created, refreshed, triage_queued, closed))
 
 
 if __name__ == "__main__":

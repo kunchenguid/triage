@@ -6,6 +6,7 @@ This doc is the optional **fast path**: add a tiny dispatch workflow to a source
 Nothing here is required to run the machine, and nothing here changes how Wheelhouse classifies items - a dispatch is just a low-latency nudge that creates a card or refreshes a pure pending card when material state has changed; the backstop still reconciles everything later.
 The scheduled scan applies Wheelhouse's owner/maintainer/bot author filter, but this explicit dispatch path trusts the source workflow and does not re-check author type, so only dispatch items you want carded.
 The scheduled scan also applies merge-conflict `needs-rebase` routing and rebase nudges; explicit dispatches do not, so the backstop may later consume a dispatched PR-review card for a PR GitHub reports as `CONFLICTING`.
+For PR-review cards, ingest can also queue the automatic lightweight triage side job after the card is created or refreshed, using the same config and token gates as the scheduled scan.
 
 > You add these files to **your source repos**, not to Wheelhouse.
 > The hub only ever reads; it never pushes to your source repos except to execute a decision you made.
@@ -28,10 +29,15 @@ A source repo notifies the hub by sending a `repository_dispatch` event with **e
 | `recommendation` | no       | recommended action shown on the card                              |
 | `priority`       | no       | `high` / `med` / `low`                                             |
 | `options`        | no       | comma-separated checkbox option keys (defaults follow `kind`; see below) |
+| `auto_triage`    | no       | `false` opts this dispatched item out of automatic PR-card triage  |
 
 The `author` field is display data for dispatched cards.
 It is rendered as plain text (`by <login>`), not as a GitHub `@mention`, so a dispatched card does not notify the target author.
 The scan-built worklist has richer GitHub author metadata and skips PRs or issues from the repo owner, the configured maintainer, or bots; dispatch payloads are explicit card requests and are not filtered again by the hub.
+The `auto_triage` field is an item-level opt-out only.
+Omit it to follow the hub's global and per-repo `auto_triage` config.
+Set it to `false` for high-volume or sensitive dispatched PR-review items that should not spend a Claude turn.
+It cannot force auto triage on when the hub or repo config disables it.
 
 Default checkbox sets are `pr-review`: `merge,close,investigate,hold`; `ci-approval`: `approve-ci,close,hold`; and `issue-triage`: `close,investigate,hold`.
 `investigate` is non-consuming: it triggers the code-grounded deep-review workflow, clears the box, and leaves the card open for the real decision.
@@ -41,6 +47,7 @@ The hub's `ingest` workflow dedupes by target: a second dispatch for the same `r
 If the existing card is still a pure `needs-decision` card and a material field changed (`head_sha`, `comp`, `tests`, `kind`, `priority`, or `options`), the hub refreshes it in place.
 Title, summary, and recommendation updates ride along with a material refresh, but do not rewrite an existing card by themselves.
 Cards already labeled `processing`, `resolved`, or `blocked` are left untouched so a refresh cannot clobber an in-flight or consumed decision.
+When auto triage is eligible, the hub writes `triaged_sha` for the current head before dispatching `triage.yml`, so a failed or timed-out run is still the only attempt for that PR head SHA.
 
 > **Legacy event type.** Before the rename to Wheelhouse the event type was `triage-item`. `ingest.yml` still listens for both (`types: [wheelhouse-item, triage-item]`), so a source repo wired up before the rename keeps working - but new dispatchers should send `wheelhouse-item`.
 

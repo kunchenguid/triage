@@ -28,6 +28,7 @@ repos:
     merge_method: squash           # squash | merge | rebase (default: squash)
     #                              # used when you approve a "Merge it" decision
     # auto_approve_ci: false       # optional override of the global setting
+    # auto_triage: false           # optional per-repo opt-out for Claude spend
 
   # All repos below share the same contribution gate: the `no-mistakes-required.yml`
   # workflow runs a job named "PR must be raised via no-mistakes" on every PR to
@@ -73,6 +74,14 @@ repos:
 # (github.repository_owner).
 maintainer: ""
 
+# Automatic lightweight PR triage. DEFAULT ON when this key is absent.
+# When CLAUDE_CODE_OAUTH_TOKEN is present, each pure needs-decision pr-review
+# card gets one quick advisory triage per PR head SHA.
+# The card gains a Summary, Product implications, and Recommended next step.
+# This never acts and never changes routing; it only gives owner-facing context.
+# Set false to opt out for token-spend control, or override per repo above.
+auto_triage: true
+
 # Code-grounded deep review is ALWAYS available (there is no enable flag). Tick
 # the "Investigate" box, or have the repo owner apply the `needs-deep-review`
 # label or run `deep-review` with the card issue number. `deep-review.yml` checks
@@ -83,7 +92,7 @@ maintainer: ""
 # "needs token" note on the card instead of silently no-opping. The optional
 # READONLY_TOKEN secret enables scoped read-only search across the target repo
 # and configured fleet repos; without it deep review keeps the legacy no-shell,
-# Read/Grep/Glob-only behavior. Both Claude-powered paths use the pinned
+# Read/Grep/Glob-only behavior. All Claude-powered paths use the pinned
 # claude-code-action v1.0.161 commit and pass `--model sonnet` to every Claude
 # step.
 

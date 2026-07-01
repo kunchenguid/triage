@@ -11,10 +11,14 @@ card-side activity never re-triggers the handler).
 CLI:
   render_card.py upsert --item-file item.json    create-or-refresh a card (dedup by marker)
   render_card.py render --item-file item.json --out-dir DIR    debug: write title/body/labels
+  render_card.py queue-triage --item-file item.json    mark triage queued and dispatch triage.yml when eligible
+  render_card.py triage-apply --issue N --head-sha SHA --execution-file FILE    update the card from Claude output
+  render_card.py triage-fail --issue N --head-sha SHA --message TEXT    write the auto-triage unavailable section
 """
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -76,6 +80,21 @@ NON_REFRESHABLE_LABELS = frozenset({"processing", "resolved", "blocked"})
 # The fields whose change makes a card materially stale and worth re-rendering.
 # Title / summary / recommendation re-render naturally; they are NOT triggers.
 MATERIAL_FIELDS = ("head_sha", "comp", "tests", "kind", "priority", "options")
+
+TRIAGE_FIELDS = ("summary", "product_implications", "recommended_next_step")
+TRIAGE_START = "<!-- wheelhouse-triage:start -->"
+TRIAGE_END = "<!-- wheelhouse-triage:end -->"
+TRIAGE_UNAVAILABLE = "Auto triage unavailable for this PR version."
+
+_STATE_BLOCK_RE = re.compile(
+    r"<!--\s*(?:wheelhouse|triage)-state:\s*(\{.*?\})\s*-->",
+    re.S,
+)
+_TRIAGE_SECTION_RE = re.compile(
+    r"\n?<!--\s*wheelhouse-triage:start\s*-->.*?"
+    r"<!--\s*wheelhouse-triage:end\s*-->\n?",
+    re.S,
+)
 
 # Sentinel for a material field absent from an old card's state block. It can
 # never equal a real value, so a card written before these fields were carried
@@ -149,6 +168,40 @@ def material_changed(item, state):
     return material_signature(item) != _state_material(state)
 
 
+def triage_fresh(item, state):
+    """True when the card has already attempted auto-triage for this PR head.
+
+    `triaged_sha` is a cost-control cache, not a material refresh field. It is
+    written before the workflow dispatch so a failed or timed-out workflow does
+    not get re-run every hourly scan for the same head SHA.
+    """
+    head_sha = item.get("head_sha", "") or ""
+    return bool(head_sha and (state or {}).get("triaged_sha") == head_sha)
+
+
+def triage_queued_for_head(state, head_sha):
+    return bool(
+        head_sha
+        and (state or {}).get("triaged_sha") == head_sha
+        and (state or {}).get("triage_status") == "queued"
+    )
+
+
+def should_auto_triage(item, state, labels, has_token=True):
+    """Whether this card should queue the lightweight automatic PR triage."""
+    if not has_token:
+        return False
+    if item.get("kind", "pr-review") != "pr-review":
+        return False
+    if item.get("auto_triage", True) is False:
+        return False
+    if not is_refreshable(labels):
+        return False
+    if not item.get("head_sha"):
+        return False
+    return not triage_fresh(item, state)
+
+
 def _label_names(labels):
     """Normalize a `gh ... --json labels` list (objects) or a plain string list
     into a set of label names."""
@@ -174,6 +227,137 @@ def plan_label_update(desired, current):
     return to_add, to_remove
 
 
+def _clean_triage_text(value, limit=700, default="n/a"):
+    text = str(value or "").strip()
+    text = text.replace("\r", "\n")
+    text = re.sub(r"\s+", " ", text)
+    # Cards are private to the owner; never notify contributors from model text.
+    text = text.replace("@", "")
+    text = text.replace("<!--", "").replace("-->", "")
+    if len(text) > limit:
+        text = text[: limit - 3].rstrip() + "..."
+    return text or default
+
+
+def normalize_triage(data):
+    if not isinstance(data, dict):
+        return None
+    triage = {}
+    for field in TRIAGE_FIELDS:
+        value = data.get(field)
+        if not isinstance(value, str):
+            return None
+        cleaned = _clean_triage_text(value, default="")
+        if not cleaned:
+            return None
+        triage[field] = cleaned
+    rec = triage["recommended_next_step"]
+    allowed = ("merge", "look closer", "discuss", "decline")
+    if not rec.lower().startswith(allowed):
+        triage["recommended_next_step"] = "look closer - " + rec
+    return triage
+
+
+def triage_section(triage=None, error=None):
+    lines = [TRIAGE_START, "### Triage", ""]
+    if triage:
+        lines.append("- **Summary:** %s" % triage["summary"])
+        lines.append("- **Product implications:** %s" % triage["product_implications"])
+        lines.append("- **Recommended next step:** %s" % triage["recommended_next_step"])
+    else:
+        note = _clean_triage_text(error or TRIAGE_UNAVAILABLE, limit=220)
+        lines.append("_%s_" % note)
+    lines.append(TRIAGE_END)
+    return "\n".join(lines)
+
+
+def remove_triage_section(body):
+    return _TRIAGE_SECTION_RE.sub("\n", body or "").strip() + "\n"
+
+
+def _existing_triage_section(body):
+    match = _TRIAGE_SECTION_RE.search(body or "")
+    return match.group(0).strip() if match else ""
+
+
+def _insert_triage_section(body, section):
+    without = remove_triage_section(body).rstrip()
+    marker = "\n### Recommended action"
+    idx = without.find(marker)
+    if idx >= 0:
+        return without[:idx].rstrip() + "\n\n" + section + "\n" + without[idx:]
+    state_idx = without.rfind("<!-- wheelhouse-state:")
+    if state_idx >= 0:
+        return without[:state_idx].rstrip() + "\n\n" + section + "\n\n" + without[state_idx:]
+    return without + "\n\n" + section
+
+
+def _replace_state_block(body, state):
+    marker = "<!-- wheelhouse-state: %s -->" % json.dumps(
+        state or {},
+        separators=(",", ":"),
+    )
+    if _STATE_BLOCK_RE.search(body or ""):
+        return _STATE_BLOCK_RE.sub(marker, body, count=1)
+    return (body or "").rstrip() + "\n\n" + marker
+
+
+def _preserve_same_head_triage(body, existing_body, item, old_state):
+    head_sha = item.get("head_sha", "") or ""
+    if not head_sha or (old_state or {}).get("head_sha") != head_sha:
+        return body
+    old_kind = (old_state or {}).get("kind")
+    new_kind = item.get("kind", "pr-review")
+    if old_kind != "pr-review" or new_kind != "pr-review":
+        return body
+
+    section = _existing_triage_section(existing_body)
+    if section:
+        body = _insert_triage_section(body, section)
+
+    state = parse_state_block(body)
+    if not state:
+        return body
+    changed = False
+    for key in ("triaged_sha", "triage_status", "triage_error"):
+        if key in (old_state or {}):
+            state[key] = old_state[key]
+            changed = True
+    return _replace_state_block(body, state) if changed else body
+
+
+def _state_with_triage(state, head_sha, status, error=None):
+    new_state = dict(state or {})
+    new_state["triaged_sha"] = head_sha
+    new_state["triage_status"] = status
+    if error:
+        new_state["triage_error"] = _clean_triage_text(error, limit=220)
+    else:
+        new_state.pop("triage_error", None)
+    return new_state
+
+
+def body_with_triage_queued(body, item):
+    state = parse_state_block(body)
+    head_sha = item.get("head_sha", "") or ""
+    if not state or state.get("kind") != "pr-review" or state.get("head_sha") != head_sha:
+        return body
+    clean = remove_triage_section(body)
+    return _replace_state_block(clean, _state_with_triage(state, head_sha, "queued"))
+
+
+def body_with_triage_result(body, head_sha, triage=None, error=None):
+    state = parse_state_block(body)
+    if not state or state.get("kind") != "pr-review" or state.get("head_sha") != head_sha:
+        return body
+    normalized = normalize_triage(triage)
+    status = "succeeded" if normalized else "error"
+    section = triage_section(normalized, error or TRIAGE_UNAVAILABLE)
+    updated = _insert_triage_section(body, section)
+    new_state = _state_with_triage(state, head_sha, status, None if normalized else error)
+    return _replace_state_block(updated, new_state)
+
+
 def render(item):
     """item -> {title, body, labels, marker}. Tolerates missing optional fields."""
     kind = item.get("kind", "pr-review")
@@ -181,6 +365,7 @@ def render(item):
     number = int(item["number"])
     title = (item.get("title") or "").strip() or "(no title)"
     options = card_options(item)
+    triage = normalize_triage(item.get("triage")) if kind == "pr-review" else None
 
     # The stored material set lets a refresh cheaply and deterministically decide
     # "did this materially change?".
@@ -193,6 +378,9 @@ def render(item):
     }
     state.update({k: v for k, v in material_signature(item).items()
                   if k != "options"})
+    if triage:
+        state["triaged_sha"] = item.get("triaged_sha") or state["head_sha"]
+        state["triage_status"] = "succeeded"
 
     short = title if len(title) <= 70 else title[:67] + "..."
     issue_title = "[%s#%d] %s" % (repo, number, short)
@@ -221,6 +409,9 @@ def render(item):
     if item.get("warning"):
         lines.append("> [!WARNING]")
         lines.append("> %s" % item["warning"])
+        lines.append("")
+    if triage:
+        lines.append(triage_section(triage))
         lines.append("")
     lines.append("### Recommended action")
     lines.append(item.get("recommendation", "Needs your call."))
@@ -298,6 +489,55 @@ def _write_body(body):
         return f.name
 
 
+def _edit_issue_body(number, body):
+    body_path = _write_body(body)
+    try:
+        _gh(["issue", "edit", str(number), "--body-file", body_path])
+    finally:
+        os.unlink(body_path)
+
+
+def mark_triage_queued(number, item, body):
+    """Cache an auto-triage attempt for this head before dispatching the LLM.
+
+    This is intentionally a hidden state update only. It bounds spend even if
+    the asynchronous workflow fails before it can write a visible result.
+    """
+    new_body = body_with_triage_queued(body, item)
+    if new_body == body:
+        return False
+    _edit_issue_body(number, new_body)
+    return True
+
+
+def dispatch_triage_workflow(number, item):
+    _gh([
+        "workflow",
+        "run",
+        "triage.yml",
+        "-f",
+        "issue=%s" % number,
+        "-f",
+        "repo=%s" % item["repo"],
+        "-f",
+        "number=%s" % item["number"],
+        "-f",
+        "head_sha=%s" % (item.get("head_sha") or ""),
+    ])
+
+
+def update_card_triage(number, head_sha, triage=None, error=None):
+    card = get_card(number)
+    if not card or not issue_is_open(card) or not is_refreshable(card.get("labels")):
+        return False
+    body = card.get("body", "")
+    new_body = body_with_triage_result(body, head_sha, triage=triage, error=error)
+    if new_body == body:
+        return False
+    _edit_issue_body(number, new_body)
+    return True
+
+
 def _create_card(card):
     body_path = _write_body(card["body"])
     try:
@@ -317,6 +557,13 @@ def _refresh_card(number, card, existing, item, old_state):
     If the target's head moved, drop a short comment so the owner sees a
     re-review is warranted rather than being silently swapped underneath."""
     to_add, to_remove = plan_label_update(card["labels"], existing.get("labels"))
+    card = dict(card)
+    card["body"] = _preserve_same_head_triage(
+        card["body"],
+        existing.get("body", ""),
+        item,
+        old_state,
+    )
     body_path = _write_body(card["body"])
     try:
         args = ["issue", "edit", str(number), "--body-file", body_path]
@@ -388,6 +635,77 @@ def close_card(number, message, label="resolved"):
     _gh(["issue", "close", str(number)], check=False)
 
 
+def _text_from_content(content):
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for item in content:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
+        ):
+            text = item["text"].strip()
+            if text:
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def extract_claude_result(path):
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            events = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(events, list):
+        return ""
+
+    for event in reversed(events):
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "result"
+            and not event.get("is_error")
+            and isinstance(event.get("result"), str)
+            and event["result"].strip()
+        ):
+            return event["result"].strip()
+
+    for event in reversed(events):
+        if isinstance(event, dict) and event.get("type") == "assistant":
+            message = event.get("message")
+            if isinstance(message, dict):
+                text = _text_from_content(message.get("content"))
+                if text:
+                    return text
+    return ""
+
+
+def parse_triage_json(text):
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start:end + 1])
+        except (TypeError, ValueError):
+            return None
+    triage = normalize_triage(data)
+    if not triage:
+        return None
+    return triage
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -407,12 +725,26 @@ def main():
     rd.add_argument("--item-file", required=True)
     rd.add_argument("--out-dir", required=True)
 
+    ta = sub.add_parser("triage-apply")
+    ta.add_argument("--issue", required=True)
+    ta.add_argument("--head-sha", required=True)
+    ta.add_argument("--execution-file", required=True)
+
+    tf = sub.add_parser("triage-fail")
+    tf.add_argument("--issue", required=True)
+    tf.add_argument("--head-sha", required=True)
+    tf.add_argument("--message", default=TRIAGE_UNAVAILABLE)
+
+    qt = sub.add_parser("queue-triage")
+    qt.add_argument("--item-file", required=True)
+
     args = ap.parse_args()
-    item = load_item(args.item_file)
 
     if args.cmd == "upsert":
+        item = load_item(args.item_file)
         upsert_card(item)
     elif args.cmd == "render":
+        item = load_item(args.item_file)
         card = render(item)
         os.makedirs(args.out_dir, exist_ok=True)
         with open(os.path.join(args.out_dir, "title"), "w") as f:
@@ -424,6 +756,42 @@ def main():
         with open(os.path.join(args.out_dir, "marker"), "w") as f:
             f.write(card["marker"])
         print(card["title"])
+    elif args.cmd == "triage-apply":
+        result_text = extract_claude_result(args.execution_file)
+        triage = parse_triage_json(result_text)
+        if triage:
+            if update_card_triage(args.issue, args.head_sha, triage=triage):
+                print("updated auto triage on card #%s" % args.issue)
+            else:
+                print("auto triage result skipped for card #%s" % args.issue)
+        else:
+            print("::warning::auto triage produced no valid structured result")
+            update_card_triage(args.issue, args.head_sha, error=TRIAGE_UNAVAILABLE)
+    elif args.cmd == "triage-fail":
+        print("::warning::auto triage failed: %s" % _clean_triage_text(args.message))
+        update_card_triage(args.issue, args.head_sha, error=args.message)
+    elif args.cmd == "queue-triage":
+        try:
+            item = load_item(args.item_file)
+            card = find_card(marker_label(item))
+            if not card:
+                print("auto triage skipped: no open card for %s" % marker_label(item))
+                return
+            current = get_card(card["number"])
+            if not current or not issue_is_open(current):
+                print("auto triage skipped: card no longer open")
+                return
+            state = parse_state_block(current.get("body", ""))
+            if not should_auto_triage(item, state, current.get("labels"), has_token=True):
+                print("auto triage skipped for card #%s" % current["number"])
+                return
+            if mark_triage_queued(current["number"], item, current.get("body", "")):
+                dispatch_triage_workflow(current["number"], item)
+                print("queued auto triage for card #%s" % current["number"])
+        except Exception as e:
+            item = locals().get("item") or {}
+            print("::warning::failed to queue auto triage for %s#%s: %s"
+                  % (item.get("repo", "?"), item.get("number", "?"), str(e)[:160]))
 
 
 if __name__ == "__main__":

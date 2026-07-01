@@ -37,6 +37,7 @@ python tests/test_reconcile.py
 python tests/test_merge_conflict.py
 python tests/test_ci_autoapprove.py
 python tests/test_author_filter.py
+python tests/test_auto_triage.py
 python tests/test_deep_review.py
 python tests/test_nl_decisions_search.py
 python - <<'PY'

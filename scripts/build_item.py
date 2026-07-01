@@ -8,11 +8,14 @@ normalized item.json that render_card.py can turn into a card.
 
 Expected fields (all but repo/number optional):
   repo, number, kind, head_sha, title, author, bucket, comp, tests,
-  summary, recommendation, priority, options (list or comma string)
+  summary, recommendation, priority, options (list or comma string),
+  auto_triage (false as an item-level opt-out)
 
 When omitted, `options` defaults by kind via render_card.CHECKBOX_OPTIONS:
 pr-review and issue-triage include the non-consuming `investigate` checkbox;
 ci-approval does not.
+When omitted, `auto_triage` follows the global/per-repo config; a false payload
+value can only opt this item out.
 """
 import json
 import os
@@ -20,8 +23,17 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from render_card import CHECKBOX_OPTIONS  # noqa: E402
+from wheelhouse_core import _auto_triage_enabled, load_config  # noqa: E402
 
 VALID_KINDS = {"pr-review", "ci-approval", "issue-triage"}
+
+
+def boolish(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 def from_payload():
@@ -71,6 +83,16 @@ def normalize(d):
     path = "pull" if kind in ("pr-review", "ci-approval") else "issues"
     url = d.get("url") or ("https://github.com/%s/%s/%s/%d" % (owner, repo, path, number)
                            if owner else "")
+    try:
+        cfg = load_config()
+        auto_triage = _auto_triage_enabled(
+            cfg["repos"].get(repo, {}),
+            cfg["auto_triage"],
+        )
+    except SystemExit:
+        auto_triage = True
+    if "auto_triage" in d and not boolish(d.get("auto_triage")):
+        auto_triage = boolish(d.get("auto_triage"))
 
     return {
         "repo": repo,
@@ -87,6 +109,7 @@ def normalize(d):
         "recommendation": str(d.get("recommendation", "") or "Needs your call."),
         "priority": str(d.get("priority", "") or "med"),
         "options": options,
+        "auto_triage": auto_triage,
     }
 
 
