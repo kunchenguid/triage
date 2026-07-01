@@ -42,6 +42,32 @@ def load_yaml(*parts):
     return yaml.safe_load(read(*parts))
 
 
+def step_by_id(steps, step_id):
+    return next((s for s in steps if s.get("id") == step_id), None)
+
+
+def step_by_name(steps, name):
+    return next((s for s in steps if s.get("name") == name), None)
+
+
+def step_index(steps, pred):
+    for i, step in enumerate(steps):
+        if pred(step):
+            return i
+    return None
+
+
+def hardened_shell_env(step):
+    env = step.get("env", {}) if step else {}
+    return (
+        env.get("PATH") == "${{ steps.trusted-src.outputs.safe_path }}"
+        and env.get("BASH_ENV") == ""
+        and env.get("ENV") == ""
+        and env.get("LD_PRELOAD") == ""
+        and env.get("LD_LIBRARY_PATH") == ""
+    )
+
+
 def labels(*names):
     return [{"name": n} for n in names]
 
@@ -237,6 +263,44 @@ def test_recommended_next_step_is_conservative_when_unexpected():
     )
 
 
+def test_triage_requires_complete_structured_json():
+    check("parse: empty object rejected", rc.normalize_triage({}) is None)
+    check("parse: error object rejected", rc.normalize_triage({"error": "timeout"}) is None)
+    check(
+        "parse: missing expected field rejected",
+        rc.normalize_triage(
+            {
+                "summary": "Adds a feature.",
+                "product_implications": "Routine work.",
+            }
+        )
+        is None,
+    )
+    check(
+        "parse: blank expected field rejected",
+        rc.normalize_triage(
+            {
+                "summary": "Adds a feature.",
+                "product_implications": "",
+                "recommended_next_step": "merge - safe.",
+            }
+        )
+        is None,
+    )
+    check(
+        "parse: non-string expected field rejected",
+        rc.normalize_triage(
+            {
+                "summary": "Adds a feature.",
+                "product_implications": ["routine"],
+                "recommended_next_step": "merge - safe.",
+            }
+        )
+        is None,
+    )
+    check("parse: error JSON text rejected", rc.parse_triage_json('{"error":"timeout"}') is None)
+
+
 def test_body_helpers_queue_and_apply_result():
     it = item()
     body = rc.render(it)["body"]
@@ -322,6 +386,57 @@ def test_reconcile_skips_when_fresh_token_absent_or_config_off():
     check("reconcile: config off skips dispatch", config_off_calls["dispatch"] == [])
 
 
+def test_queue_triage_command_warns_on_dispatch_failure():
+    it = item(auto_triage=True)
+    current = card_row(it)
+
+    def fake_find(marker):
+        return {"number": current["number"], "body": current["body"], "labels": current["labels"]}
+
+    def fake_get(number):
+        return current
+
+    def fake_mark(number, queued_item, body):
+        current["body"] = rc.body_with_triage_queued(body, queued_item)
+        return True
+
+    def fake_dispatch(number, queued_item):
+        raise RuntimeError("workflow dispatch unavailable")
+
+    old = (
+        sys.argv[:],
+        rc.find_card,
+        rc.get_card,
+        rc.mark_triage_queued,
+        rc.dispatch_triage_workflow,
+    )
+    rc.find_card = fake_find
+    rc.get_card = fake_get
+    rc.mark_triage_queued = fake_mark
+    rc.dispatch_triage_workflow = fake_dispatch
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            item_path = os.path.join(d, "item.json")
+            with open(item_path, "w") as f:
+                json.dump(it, f)
+            sys.argv = ["render_card.py", "queue-triage", "--item-file", item_path]
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc.main()
+            out = buf.getvalue()
+    finally:
+        (
+            sys.argv,
+            rc.find_card,
+            rc.get_card,
+            rc.mark_triage_queued,
+            rc.dispatch_triage_workflow,
+        ) = old
+
+    check("queue cli: dispatch failure warns", "::warning::failed to queue auto triage" in out)
+    check("queue cli: queued cache was still written", "triage_status" in current["body"])
+
+
 def test_reconcile_queues_after_head_refresh():
     old = item(head_sha="oldsha", auto_triage=True)
     old_card = card_row(old)
@@ -340,6 +455,9 @@ def test_triage_workflow_security_wiring():
     doc = load_yaml(".github", "workflows", "triage.yml")
     steps = doc["jobs"]["triage"]["steps"]
     text = read(".github", "workflows", "triage.yml")
+    trusted = step_by_id(steps, "trusted-src")
+    preserve = step_by_id(steps, "triage-result")
+    update = step_by_name(steps, "Update the decision card")
 
     checkouts = [s for s in steps if "actions/checkout" in str(s.get("uses", ""))]
     check(
@@ -362,6 +480,26 @@ def test_triage_workflow_security_wiring():
         check(
             "workflow: target checkout persists no credentials",
             target_checkout["with"].get("persist-credentials") is False,
+        )
+
+    check("workflow: trusted source snapshot exists", trusted is not None)
+    if trusted:
+        run = str(trusted.get("run", ""))
+        check(
+            "workflow: trusted source is copied outside the Claude workspace",
+            "${RUNNER_TEMP}/wheelhouse-trusted-src" in run
+            and "tar --exclude=.git" in run,
+        )
+        check(
+            "workflow: trusted source is made read-only",
+            'find "$trusted" -type f -exec chmod a-w {} +' in run
+            and 'find "$trusted" -type d -exec chmod a-w {} +' in run,
+        )
+        check(
+            "workflow: trusted source path and tools are exposed",
+            'echo "path=$trusted"' in run
+            and 'echo "python=$python_path"' in run
+            and 'echo "safe_path=$safe_path"' in run,
         )
 
     claude_steps = [s for s in steps if "claude-code-action" in str(s.get("uses", ""))]
@@ -400,9 +538,87 @@ def test_triage_workflow_security_wiring():
         "workflow: prompt says advisory only and never act",
         "This is advisory" in text and "Never act" in text,
     )
+
+    check("workflow: triage result handoff exists", preserve is not None)
+    if preserve:
+        env = yaml.safe_dump(preserve.get("env", {}))
+        run = str(preserve.get("run", ""))
+        check(
+            "workflow: triage result captures either Claude execution file",
+            "EXECUTION_FILE" in env
+            and "steps.claude_search.outputs.execution_file" in env
+            and "steps.claude.outputs.execution_file" in env,
+        )
+        check(
+            "workflow: triage result uses trusted shell PATH",
+            hardened_shell_env(preserve),
+        )
+        check(
+            "workflow: triage result stores only an isolated execution file",
+            "${RUNNER_TEMP}/wheelhouse-triage" in run
+            and 'cp "$EXECUTION_FILE" "$out_file"' in run,
+        )
+        check(
+            "workflow: triage result rejects symlink or non-file output",
+            '[ -L "$EXECUTION_FILE" ]' in run and '[ ! -f "$EXECUTION_FILE" ]' in run,
+        )
+        check(
+            "workflow: triage result caps execution file size",
+            "262144" in run and 'wc -c < "$EXECUTION_FILE"' in run,
+        )
+
+    check("workflow: final card update step exists", update is not None)
+    if update:
+        env = update.get("env", {})
+        run = str(update.get("run", ""))
+        dumped = yaml.safe_dump(update)
+        check(
+            "workflow: final card update runs from trusted source",
+            update.get("working-directory") == "${{ steps.trusted-src.outputs.path }}",
+        )
+        check(
+            "workflow: final card update uses captured trusted Python",
+            env.get("TRUSTED_PYTHON") == "${{ steps.trusted-src.outputs.python }}",
+        )
+        check(
+            "workflow: final card update uses trusted shell PATH",
+            hardened_shell_env(update)
+            and env.get("TRUSTED_PATH") == "${{ steps.trusted-src.outputs.safe_path }}",
+        )
+        check(
+            "workflow: final card update reads isolated result file",
+            env.get("TRIAGE_EXECUTION_FILE") == "${{ steps.triage-result.outputs.path }}",
+        )
+        check(
+            "workflow: final card update scrubs inherited model environment",
+            "env -i" in run
+            and "PYTHONDONTWRITEBYTECODE=1" in run
+            and "PYTHONNOUSERSITE=1" in run,
+        )
+        check(
+            "workflow: final card update uses render_card triage commands",
+            "scripts/render_card.py triage-apply" in run
+            and "scripts/render_card.py triage-fail" in run,
+        )
+        check("workflow: final card update never receives FLEET_TOKEN", "FLEET_TOKEN" not in dumped)
+
+    trusted_i = step_index(steps, lambda s: s.get("id") == "trusted-src")
+    preserve_i = step_index(steps, lambda s: s.get("id") == "triage-result")
+    update_i = step_index(steps, lambda s: s.get("name") == "Update the decision card")
+    claude_indexes = [
+        i for i, s in enumerate(steps) if "claude-code-action" in str(s.get("uses", ""))
+    ]
     check(
-        "workflow: final card update uses render_card triage-apply",
-        "triage-apply" in text and "triage-fail" in text,
+        "workflow: trusted source is prepared before Claude",
+        trusted_i is not None and claude_indexes and all(trusted_i < i for i in claude_indexes),
+    )
+    check(
+        "workflow: triage result handoff runs after Claude",
+        preserve_i is not None and claude_indexes and all(i < preserve_i for i in claude_indexes),
+    )
+    check(
+        "workflow: trusted card update runs after isolated handoff",
+        None not in (preserve_i, update_i) and preserve_i < update_i,
     )
 
 
@@ -428,10 +644,12 @@ def main():
     test_build_item_carries_effective_auto_triage()
     test_render_triage_section_has_no_mentions_and_caches_sha()
     test_recommended_next_step_is_conservative_when_unexpected()
+    test_triage_requires_complete_structured_json()
     test_body_helpers_queue_and_apply_result()
     test_should_auto_triage_cache_and_gates()
     test_reconcile_backfills_legacy_card_without_material_change()
     test_reconcile_skips_when_fresh_token_absent_or_config_off()
+    test_queue_triage_command_warns_on_dispatch_failure()
     test_reconcile_queues_after_head_refresh()
     test_triage_workflow_security_wiring()
     test_scan_and_ingest_can_dispatch_with_default_token()

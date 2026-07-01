@@ -69,6 +69,24 @@ jobs:
       - name: Install deps
         run: pip install --quiet pyyaml
 
+      - id: trusted-src
+        run: |
+          set -euo pipefail
+          trusted="${RUNNER_TEMP}/wheelhouse-trusted-src"
+          python_path="$(command -v python)"
+          gh_path="$(command -v gh)"
+          safe_path="$(dirname "$python_path"):$(dirname "$gh_path"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          rm -rf "$trusted"
+          mkdir -p "$trusted"
+          tar --exclude=.git -cf - . | tar -xf - -C "$trusted"
+          find "$trusted" -type f -exec chmod a-w {} +
+          find "$trusted" -type d -exec chmod a-w {} +
+          {
+            echo "path=$trusted"
+            echo "python=$python_path"
+            echo "safe_path=$safe_path"
+          } >> "$GITHUB_OUTPUT"
+
       - id: gate
         env:
           HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
@@ -307,25 +325,77 @@ jobs:
             --max-turns 8
             --model sonnet
 
+      - id: triage-result
+        if: ${{ always() && steps.gate.outputs.enabled == 'true' && steps.resolve.outputs.skip != 'true' && steps.verify_head.outputs.head_ok != 'false' }}
+        env:
+          EXECUTION_FILE: ${{ steps.claude_search.outputs.execution_file || steps.claude.outputs.execution_file }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+        run: |
+          set -euo pipefail
+          out_dir="${RUNNER_TEMP}/wheelhouse-triage"
+          out_file="$out_dir/execution.json"
+          rm -rf "$out_dir"
+          mkdir -p "$out_dir"
+          result_path=""
+          if [ -n "${EXECUTION_FILE:-}" ]; then
+            if [ -L "$EXECUTION_FILE" ] || [ ! -f "$EXECUTION_FILE" ]; then
+              echo "::warning::auto triage produced no regular execution file"
+            else
+              size=$(wc -c < "$EXECUTION_FILE")
+              size=${size//[[:space:]]/}
+              if [ "$size" -gt 262144 ]; then
+                echo "::warning::auto triage execution file is too large"
+              else
+                cp "$EXECUTION_FILE" "$out_file"
+                result_path="$out_file"
+              fi
+            fi
+          fi
+          echo "path=$result_path" >> "$GITHUB_OUTPUT"
+
       - name: Update the decision card
         if: ${{ always() && steps.gate.outputs.enabled == 'true' && steps.resolve.outputs.skip != 'true' }}
+        working-directory: ${{ steps.trusted-src.outputs.path }}
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ steps.resolve.outputs.issue }}
           HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
           HEAD_OK: ${{ steps.verify_head.outputs.head_ok }}
           HEAD_MESSAGE: ${{ steps.verify_head.outputs.message }}
-          EXECUTION_FILE: ${{ steps.claude_search.outputs.execution_file || steps.claude.outputs.execution_file }}
+          TRIAGE_EXECUTION_FILE: ${{ steps.triage-result.outputs.path }}
+          TRUSTED_PYTHON: ${{ steps.trusted-src.outputs.python }}
+          TRUSTED_PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          PYTHONHOME: ""
+          PYTHONPATH: ""
         run: |
           set -euo pipefail
           if [ "${HEAD_OK:-}" = "false" ]; then
-            python scripts/render_card.py triage-fail \
-              --issue "$ISSUE" \
-              --head-sha "$HEAD_SHA" \
-              --message "${HEAD_MESSAGE:-Auto triage did not run because the target PR head moved.}"
+            env -i \
+              PATH="$TRUSTED_PATH" \
+              PYTHONDONTWRITEBYTECODE=1 \
+              PYTHONNOUSERSITE=1 \
+              GH_TOKEN="$GH_TOKEN" \
+              "$TRUSTED_PYTHON" scripts/render_card.py triage-fail \
+                --issue "$ISSUE" \
+                --head-sha "$HEAD_SHA" \
+                --message "${HEAD_MESSAGE:-Auto triage did not run because the target PR head moved.}"
           else
-            python scripts/render_card.py triage-apply \
-              --issue "$ISSUE" \
-              --head-sha "$HEAD_SHA" \
-              --execution-file "${EXECUTION_FILE:-}"
+            env -i \
+              PATH="$TRUSTED_PATH" \
+              PYTHONDONTWRITEBYTECODE=1 \
+              PYTHONNOUSERSITE=1 \
+              GH_TOKEN="$GH_TOKEN" \
+              "$TRUSTED_PYTHON" scripts/render_card.py triage-apply \
+                --issue "$ISSUE" \
+                --head-sha "$HEAD_SHA" \
+                --execution-file "${TRIAGE_EXECUTION_FILE:-}"
           fi

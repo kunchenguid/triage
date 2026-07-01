@@ -216,7 +216,7 @@ def plan_label_update(desired, current):
     return to_add, to_remove
 
 
-def _clean_triage_text(value, limit=700):
+def _clean_triage_text(value, limit=700, default="n/a"):
     text = str(value or "").strip()
     text = text.replace("\r", "\n")
     text = re.sub(r"\s+", " ", text)
@@ -225,13 +225,21 @@ def _clean_triage_text(value, limit=700):
     text = text.replace("<!--", "").replace("-->", "")
     if len(text) > limit:
         text = text[: limit - 3].rstrip() + "..."
-    return text or "n/a"
+    return text or default
 
 
 def normalize_triage(data):
     if not isinstance(data, dict):
         return None
-    triage = {field: _clean_triage_text(data.get(field)) for field in TRIAGE_FIELDS}
+    triage = {}
+    for field in TRIAGE_FIELDS:
+        value = data.get(field)
+        if not isinstance(value, str):
+            return None
+        cleaned = _clean_triage_text(value, default="")
+        if not cleaned:
+            return None
+        triage[field] = cleaned
     rec = triage["recommended_next_step"]
     allowed = ("merge", "look closer", "discuss", "decline")
     if not rec.lower().startswith(allowed):
@@ -716,22 +724,27 @@ def main():
         print("::warning::auto triage failed: %s" % _clean_triage_text(args.message))
         update_card_triage(args.issue, args.head_sha, error=args.message)
     elif args.cmd == "queue-triage":
-        item = load_item(args.item_file)
-        card = find_card(marker_label(item))
-        if not card:
-            print("auto triage skipped: no open card for %s" % marker_label(item))
-            return
-        current = get_card(card["number"])
-        if not current or not issue_is_open(current):
-            print("auto triage skipped: card no longer open")
-            return
-        state = parse_state_block(current.get("body", ""))
-        if not should_auto_triage(item, state, current.get("labels"), has_token=True):
-            print("auto triage skipped for card #%s" % current["number"])
-            return
-        if mark_triage_queued(current["number"], item, current.get("body", "")):
-            dispatch_triage_workflow(current["number"], item)
-            print("queued auto triage for card #%s" % current["number"])
+        try:
+            item = load_item(args.item_file)
+            card = find_card(marker_label(item))
+            if not card:
+                print("auto triage skipped: no open card for %s" % marker_label(item))
+                return
+            current = get_card(card["number"])
+            if not current or not issue_is_open(current):
+                print("auto triage skipped: card no longer open")
+                return
+            state = parse_state_block(current.get("body", ""))
+            if not should_auto_triage(item, state, current.get("labels"), has_token=True):
+                print("auto triage skipped for card #%s" % current["number"])
+                return
+            if mark_triage_queued(current["number"], item, current.get("body", "")):
+                dispatch_triage_workflow(current["number"], item)
+                print("queued auto triage for card #%s" % current["number"])
+        except Exception as e:
+            item = locals().get("item") or {}
+            print("::warning::failed to queue auto triage for %s#%s: %s"
+                  % (item.get("repo", "?"), item.get("number", "?"), str(e)[:160]))
 
 
 if __name__ == "__main__":
