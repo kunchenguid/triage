@@ -221,6 +221,10 @@ def _view_request(req, runner, kind):
     return _cap(runner([kind, "view", number, "-R", repo, "--json", fields]))
 
 
+def _search_args(kind, repo, query, limit):
+    return ["search", kind, "--repo", repo, "--limit", limit, "--", query]
+
+
 def handle_request(req, allowed, runner=run_gh):
     if not isinstance(req, dict):
         raise ValueError("request must be a JSON object")
@@ -266,7 +270,7 @@ def handle_request(req, allowed, runner=run_gh):
         limit = str(_limit(request))
         return _run_for_repos(
             repos,
-            lambda repo: ["search", "prs", query, "--repo", repo, "--limit", limit],
+            lambda repo: _search_args("prs", repo, query, limit),
             runner,
         )
     if op == "search_issues":
@@ -274,7 +278,7 @@ def handle_request(req, allowed, runner=run_gh):
         limit = str(_limit(request))
         return _run_for_repos(
             repos,
-            lambda repo: ["search", "issues", query, "--repo", repo, "--limit", limit],
+            lambda repo: _search_args("issues", repo, query, limit),
             runner,
         )
     if op == "search_code":
@@ -282,7 +286,7 @@ def handle_request(req, allowed, runner=run_gh):
         limit = str(_limit(request))
         return _run_for_repos(
             repos,
-            lambda repo: ["search", "code", query, "--repo", repo, "--limit", limit],
+            lambda repo: _search_args("code", repo, query, limit),
             runner,
         )
     raise ValueError("unsupported search operation: %s" % op)

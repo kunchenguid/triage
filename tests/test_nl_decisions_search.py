@@ -253,13 +253,14 @@ def test_search_wrapper_hardcodes_repo_flags():
     check("wrapper: search runs once per allowed repo", len(calls) == 2)
     check(
         "wrapper: search caps requested limit",
-        all(call[-1] == "50" for call in calls),
+        all(call[4:7] == ["--limit", "50", "--"] for call in calls),
     )
     check(
         "wrapper: search passes only allowed repo flags",
         all(
-            "--repo" in call
-            and call[call.index("--repo") + 1] in {"owner/target", "owner/fleet"}
+            call[:3] == ["search", "prs", "--repo"]
+            and call[3] in {"owner/target", "owner/fleet"}
+            and call[4:7] == ["--limit", "50", "--"]
             for call in calls
         ),
     )
@@ -267,6 +268,33 @@ def test_search_wrapper_hardcodes_repo_flags():
         "wrapper: search output is grouped by repo",
         "### owner/target" in out and "### owner/fleet" in out,
     )
+
+
+def test_search_wrapper_places_untrusted_query_after_separator():
+    for op, kind in (
+        ("search_prs", "prs"),
+        ("search_issues", "issues"),
+        ("search_code", "code"),
+    ):
+        calls = []
+        query = "--repo=other/private duplicate fix"
+
+        def fake(args):
+            calls.append(args)
+            return "ok"
+
+        nls.handle_request(
+            {"op": op, "query": query},
+            ["owner/target"],
+            fake,
+        )
+        expected = [
+            ["search", kind, "--repo", "owner/target", "--limit", "20", "--", query]
+        ]
+        check(
+            "wrapper: %s query cannot add repo flags" % op,
+            calls == expected,
+        )
 
 
 def test_search_wrapper_rejects_query_scope_qualifiers():
@@ -390,6 +418,7 @@ def main():
     test_search_wrapper_repositories_are_owner_scoped()
     test_search_wrapper_rejects_out_of_scope_repo()
     test_search_wrapper_hardcodes_repo_flags()
+    test_search_wrapper_places_untrusted_query_after_separator()
     test_search_wrapper_rejects_query_scope_qualifiers()
     test_claude_output_is_isolated_before_routing()
     test_route_and_execute_stay_deterministic()
